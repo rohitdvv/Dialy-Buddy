@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { DailyAnalysis, TabView, ActivityData, NutritionData, JournalData, User, DeviceConnection, ChatMessage } from './types';
 import Dashboard from './components/Dashboard';
 import NutritionTracker from './components/NutritionTracker';
@@ -12,6 +12,8 @@ import Guide from './components/Guide';
 import { generateWellnessRecommendations } from './services/geminiService';
 
 const App: React.FC = () => {
+  const notificationTimeoutRef = useRef<number | null>(null);
+
   // Auth State
   const [user, setUser] = useState<User | null>(null);
 
@@ -52,34 +54,59 @@ const App: React.FC = () => {
 
   // --- INITIALIZATION & PERSISTENCE ---
 
+  const readStorage = <T,>(key: string, fallback: T): T => {
+    const value = localStorage.getItem(key);
+    if (!value) return fallback;
+
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      console.warn(`Invalid localStorage data for key: ${key}`);
+      return fallback;
+    }
+  };
+
+  const showTimedNotification = (message: string, type: 'ALERT' | 'INFO', durationMs = 3000) => {
+    if (notificationTimeoutRef.current) {
+      window.clearTimeout(notificationTimeoutRef.current);
+    }
+
+    setNotification({ message, type });
+    notificationTimeoutRef.current = window.setTimeout(() => {
+      setNotification(null);
+      notificationTimeoutRef.current = null;
+    }, durationMs);
+  };
+
   useEffect(() => {
     // Load User
-    const storedUser = localStorage.getItem('hg_user');
-    if (storedUser) setUser(JSON.parse(storedUser));
+    setUser(readStorage<User | null>('hg_user', null));
 
     // Load Data
-    const storedJournal = localStorage.getItem('hg_journal');
-    if (storedJournal) setJournalHistory(JSON.parse(storedJournal));
-
-    const storedNutrition = localStorage.getItem('hg_nutrition');
-    if (storedNutrition) setNutritionHistory(JSON.parse(storedNutrition));
-
-    const storedChat = localStorage.getItem('hg_chat');
-    if (storedChat) setChatHistory(JSON.parse(storedChat));
+    setJournalHistory(readStorage<JournalData[]>('hg_journal', []));
+    setNutritionHistory(readStorage<NutritionData[]>('hg_nutrition', []));
+    setChatHistory(readStorage<ChatMessage[]>('hg_chat', []));
     
     // Load Devices
-    const storedDevices = localStorage.getItem('hg_devices');
-    if (storedDevices) setConnectedDevices(JSON.parse(storedDevices));
+    setConnectedDevices(readStorage<DeviceConnection[]>('hg_devices', []));
 
   }, []);
 
   useEffect(() => {
     // Persist Data on Change
-    if (journalHistory.length > 0) localStorage.setItem('hg_journal', JSON.stringify(journalHistory));
-    if (nutritionHistory.length > 0) localStorage.setItem('hg_nutrition', JSON.stringify(nutritionHistory));
-    if (chatHistory.length > 0) localStorage.setItem('hg_chat', JSON.stringify(chatHistory));
+    localStorage.setItem('hg_journal', JSON.stringify(journalHistory));
+    localStorage.setItem('hg_nutrition', JSON.stringify(nutritionHistory));
+    localStorage.setItem('hg_chat', JSON.stringify(chatHistory));
     localStorage.setItem('hg_devices', JSON.stringify(connectedDevices));
   }, [journalHistory, nutritionHistory, chatHistory, connectedDevices]);
+
+  useEffect(() => {
+    return () => {
+      if (notificationTimeoutRef.current) {
+        window.clearTimeout(notificationTimeoutRef.current);
+      }
+    };
+  }, []);
 
   // --- DEVICE SIMULATION (LIVE UPDATES) ---
   useEffect(() => {
@@ -144,19 +171,18 @@ const App: React.FC = () => {
     
     // Immediate AI Notification Logic
     if (data.stressLevel >= 7 || data.sentimentScore < -0.3) {
-      setNotification({
-        type: 'ALERT',
-        message: `High stress detected in your entry. Analysis suggests: ${data.mood.toLowerCase()}. Try a 2-minute breathing exercise.`
-      });
+      showTimedNotification(
+        `High stress detected in your entry. Analysis suggests: ${data.mood.toLowerCase()}. Try a 2-minute breathing exercise.`,
+        'ALERT',
+        8000
+      );
     } else if (data.sentimentScore > 0.5) {
-      setNotification({
-        type: 'INFO',
-        message: `Great to see you in a ${data.mood.toLowerCase()} mood! Keep up the positive momentum.`
-      });
+      showTimedNotification(
+        `Great to see you in a ${data.mood.toLowerCase()} mood! Keep up the positive momentum.`,
+        'INFO',
+        8000
+      );
     }
-
-    // Auto-hide notification
-    setTimeout(() => setNotification(null), 8000);
   };
 
   const handleChatSend = (text: string, role: 'user' | 'model') => {
@@ -194,14 +220,12 @@ const App: React.FC = () => {
   // Device Handlers
   const handleConnectDevice = (device: DeviceConnection) => {
     setConnectedDevices(prev => [...prev.filter(d => d.id !== device.id), device]);
-    setNotification({ type: 'INFO', message: `${device.name} connected successfully.` });
-    setTimeout(() => setNotification(null), 3000);
+    showTimedNotification(`${device.name} connected successfully.`, 'INFO');
   };
 
   const handleDisconnectDevice = (id: string) => {
     setConnectedDevices(prev => prev.filter(d => d.id !== id));
-    setNotification({ type: 'INFO', message: `Device disconnected.` });
-    setTimeout(() => setNotification(null), 3000);
+    showTimedNotification('Device disconnected.', 'INFO');
   };
 
   const handleBluetoothData = (hr: number) => {
@@ -232,7 +256,7 @@ const App: React.FC = () => {
     if (user && (nutritionHistory.length > 0 || journalHistory.length > 0)) {
       updateReport();
     }
-  }, [nutritionHistory.length, journalHistory.length, activityData, user]);
+  }, [nutritionHistory, journalHistory, activityData, user]);
 
   // --- RENDER ---
 
