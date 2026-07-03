@@ -1,0 +1,85 @@
+{
+  "theme": "Dark Mode Performance & Luxury Hybrid",
+  "archetype": "5 (Luxury) + 2 (Performance Pro)",
+  "vibe": "Clinical precision meets human warmth. High-end, moody, data-driven like Oura or Whoop.",
+  "colors": {
+    "background": "#050505",
+    "surface": "#121212",
+    "surface_glass": "rgba(255, 255, 255, 0.03)",
+    "border": "#262626",
+    "border_glass": "rgba(255, 255, 255, 0.08)",
+    "text_primary": "#F2EFE9",
+    "text_secondary": "#A1A1AA",
+    "accent_primary": "#D86B45",
+    "accent_secondary": "#E2C07C",
+    "status_success": "#7A9371",
+    "status_warning": "#E2C07C",
+    "status_danger": "#B96D71"
+  },
+  "typography": {
+    "fonts": {
+      "headings": "'Outfit', sans-serif",
+      "body": "'Manrope', sans-serif",
+      "data": "'JetBrains Mono', monospace"
+    },
+    "rules": {
+      "headings": "Tracking tight, clean formatting. No generic default weights.",
+      "data_metrics": "Use JetBrains Mono for all numeric values, scores, and technical data.",
+      "hierarchy": "H1 up to text-5xl, fluid scaling. Strict adherence to hierarchy gap."
+    }
+  },
+  "layout_spacing": {
+    "dashboard_grid": "Bento Control Room grid layout. Tightly packed (gap-6) on desktop, grid-cols-1 md:grid-cols-3 lg:grid-cols-4.",
+    "card_padding": "Generous inner padding (p-6 or p-8).",
+    "surfaces": "Glassmorphism with 1px border. bg-white/5 backdrop-blur-2xl border border-white/10 rounded-2xl.",
+    "alignment": "Optical alignment over geometrical. Left-align dense data."
+  },
+  "components": {
+    "wellness_score": {
+      "name": "Biometric Orbital Ring",
+      "description": "An elegant, glowing radial SVG visualization representing the wellness score. Features layered concentric rings with dashed arrays and subtle drop-shadows (drop-shadow-[0_0_12px_rgba(216,107,69,0.4)]) to mimic living biometric telemetry."
+    },
+    "insights_card": {
+      "name": "Oura-style Insight Cards",
+      "description": "Dark, glassmorphic cards with muted textures. Use subtle gradients for the inner ring and bold mono-font metrics. Must use border-white/10 and backdrop-blur-2xl."
+    },
+    "buttons": {
+      "primary": "Solid #D86B45 background, #050505 text, subtle hover lift, rounded-full or rounded-xl.",
+      "secondary": "Transparent background, border-white/20, text-white, hover:bg-white/10, rounded-xl."
+    },
+    "data_testids": {
+      "rule": "Every interactive and critical info element MUST have a data-testid. Format: kebab-case role-based (e.g., 'wellness-score-ring', 'nav-home-link')."
+    }
+  },
+  "micro_interactions": {
+    "hover": "Subtle -translate-y-1 and shadow-lg on cards.",
+    "transitions": "transition-all duration-300 ease-out.",
+    "load_state": "Framer motion staggered fade-in for dashboard tiles."
+  },
+  "media": {
+    "abstract_background": {
+      "url": "https://images.pexels.com/photos/7505924/pexels-photo-7505924.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Dark rippling water texture for subtle background noise or auth screen background."
+    },
+    "user_avatar": {
+      "url": "https://images.pexels.com/photos/36623225/pexels-photo-36623225.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Elegant portrait for user profile in the header."
+    },
+    "nutrition_placeholder": {
+      "url": "https://images.unsplash.com/photo-1761315600943-d8a5bb0c499f?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NzZ8MHwxfHNlYXJjaHwxfHxnb3VybWV0JTIwc2FsYWQlMjBkYXJrJTIwcGxhdGV8ZW58MHx8fHwxNzgyNjA2MDMyfDA&ixlib=rb-4.1.0&q=85",
+      "description": "Gourmet salad on dark plate for nutrition history items."
+    }
+  },
+  "instructions_to_main_agent": [
+    "Use ONLY .jsx or .js extensions for React components. Do not use .tsx.",
+    "Strictly follow the color palette provided in this JSON. DO NOT use generic Tailwind blues, purples, or teals.",
+    "Implement the 'Biometric Orbital Ring' using an SVG with Recharts or custom pure React+SVG with stroke-dasharray.",
+    "All cards must have a 1px border (border-white/10) and backdrop-blur-xl to mimic high-end glassmorphism over a #050505 base.",
+    "Inject JetBrains Mono for all numeric readouts.",
+    "Add 'data-testid' to EVERY button, link, form input, and main data display tile.",
+    "Ensure 'react-icons' or '@phosphor-icons/react' are used. Install them if needed.",
+    "Keep text contrast strictly WCAG AA or APCA compliant. Body text must be at least #A1A1AA against the dark background.",
+    "Avoid using Shadcn standard Card elements if they conflict with the 1px white/10 border + backdrop-blur aesthetic. Build raw HTML + Tailwind where needed for layouts.",
+    "Ensure the application structure connects the frontend React (Vite) app to the FastAPI backend with MongoDB."
+  ]
+}
