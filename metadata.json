@@ -1,8 +1,0 @@
-{
-  "name": "HealthGuardAI",
-  "description": "A multimodal Generative AI system for preventive wellness, analyzing diet, voice, and activity to detect early health risks.",
-  "requestFramePermissions": [
-    "microphone",
-    "camera"
-  ]
-}
