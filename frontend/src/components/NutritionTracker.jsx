@@ -37,7 +37,9 @@ export default function NutritionTracker({ entries, onAdded, onRefresh }) {
       setPreview(null)
       setSelectedDate(new Date().toDateString())
     } catch (e) {
-      alert('Failed to analyze image. Please try a clearer photo.')
+      const msg = e?.response?.data?.detail || 'Failed to analyze image. Please try a clearer photo.'
+      alert(typeof msg === 'string' ? msg : 'Failed to analyze image. Please try a clearer photo.')
+      setPreview(null)
     } finally { setAnalyzing(false) }
   }
 

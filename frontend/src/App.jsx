@@ -143,7 +143,8 @@ export default function App() {
       const { data } = await api.post('/chat', { message: text })
       setChat(prev => [...prev.filter(m => m.id !== optimistic.id), data.user_message, data.reply])
     } catch (e) {
-      showToast('Could not reach the AI companion.', 'ALERT')
+      setChat(prev => prev.filter(m => m.id !== optimistic.id))
+      showToast('Could not reach the AI companion. Please try again.', 'ALERT')
     }
   }
 
@@ -192,6 +193,7 @@ export default function App() {
               journal={journal}
               streak={streak}
               onChangeTab={setTab}
+              loadingInsights={loadingInsights}
             />
           )}
           {tab === 'NUTRITION' && (

@@ -5,7 +5,7 @@ import BiometricRing from './BiometricRing.jsx'
 import InsightCard from './InsightCard.jsx'
 import { Flame, Trophy, Award, Utensils, Moon, HeartPulse, Sparkles } from 'lucide-react'
 
-export default function Dashboard({ insights, activity, nutrition, journal, streak, onChangeTab }) {
+export default function Dashboard({ insights, activity, nutrition, journal, streak, onChangeTab, loadingInsights }) {
   const [history, setHistory] = useState([])
 
   useEffect(() => {
@@ -166,6 +166,17 @@ export default function Dashboard({ insights, activity, nutrition, journal, stre
           <span className="text-[10px] uppercase tracking-[0.2em] text-muted">Powered by Gemini 2.5</span>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+          {loadingInsights && (insights.recommendations || []).length === 0 && (
+            Array.from({length:4}).map((_,i) => (
+              <div key={i} className="glass rounded-3xl p-5 h-40 relative overflow-hidden">
+                <div className="w-24 h-5 rounded-full shimmer" />
+                <div className="mt-4 w-40 h-4 rounded shimmer" />
+                <div className="mt-2 w-56 h-3 rounded shimmer" />
+                <div className="mt-2 w-48 h-3 rounded shimmer" />
+                <div className="mt-6 w-20 h-3 rounded shimmer" />
+              </div>
+            ))
+          )}
           {(insights.recommendations || []).map((r, i) => (
             <InsightCard key={i} rec={r} idx={i} />
           ))}

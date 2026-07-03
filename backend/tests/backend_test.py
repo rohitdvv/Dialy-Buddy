@@ -91,22 +91,67 @@ def _tiny_jpeg_bytes():
 def test_nutrition_analyze_and_list(s, demo_token):
     files = {"file": ("meal.jpg", _tiny_jpeg_bytes(), "image/jpeg")}
     r = requests.post(f"{BASE_URL}/api/nutrition/analyze", files=files, headers=auth(demo_token), timeout=120)
-    assert r.status_code == 200, r.text
-    d = r.json()
-    for k in ("foodName", "calories", "protein", "carbs", "fat", "healthScore", "analysis", "id"):
-        assert k in d
-    # persist
-    r2 = requests.get(f"{BASE_URL}/api/nutrition", headers=auth(demo_token))
-    assert r2.status_code == 200
-    lst = r2.json()
-    assert isinstance(lst, list) and len(lst) >= 1
-    assert any(item.get("id") == d["id"] for item in lst)
+    # Post-fix, a 1x1 synthetic JPEG legitimately triggers the new "no food detected" 422 guard.
+    # Accept either 200 (LLM hallucinated food) or 422 (correctly rejected). Valid-food entry
+    # creation is covered by the frontend Playwright regression on a real photo.
+    assert r.status_code in (200, 422), r.text
+    if r.status_code == 200:
+        d = r.json()
+        for k in ("foodName", "calories", "protein", "carbs", "fat", "healthScore", "analysis", "id"):
+            assert k in d
+        # persist
+        r2 = requests.get(f"{BASE_URL}/api/nutrition", headers=auth(demo_token))
+        assert r2.status_code == 200
+        lst = r2.json()
+        assert isinstance(lst, list) and len(lst) >= 1
+        assert any(item.get("id") == d["id"] for item in lst)
+    else:
+        d = r.json()
+        assert "detail" in d
 
 
 def test_nutrition_requires_auth():
     files = {"file": ("meal.jpg", _tiny_jpeg_bytes(), "image/jpeg")}
     r = requests.post(f"{BASE_URL}/api/nutrition/analyze", files=files)
     assert r.status_code == 401
+
+
+# REGRESSION: blank/black JPEG must return 422, not create a bogus 0-cal entry.
+def _blank_black_jpeg_bytes():
+    # 8x8 all-black JPEG generated at runtime to guarantee "no food"
+    try:
+        from PIL import Image
+    except Exception:
+        pytest.skip("Pillow not available")
+    img = Image.new("RGB", (16, 16), (0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def test_nutrition_blank_image_returns_422(demo_token):
+    files = {"file": ("blank.jpg", _blank_black_jpeg_bytes(), "image/jpeg")}
+    r = requests.post(
+        f"{BASE_URL}/api/nutrition/analyze",
+        files=files,
+        headers=auth(demo_token),
+        timeout=120,
+    )
+    # Must be 422 (helpful validation) not 200 or 500
+    assert r.status_code == 422, f"expected 422 for blank image, got {r.status_code}: {r.text}"
+    body = r.json()
+    assert "detail" in body
+    assert isinstance(body["detail"], str) and len(body["detail"]) > 0
+
+
+# REGRESSION: DELETE /api/nutrition/{invalid-id} -> 404 (not 500).
+def test_nutrition_delete_invalid_id_returns_404(demo_token):
+    r = requests.delete(
+        f"{BASE_URL}/api/nutrition/not-an-object-id",
+        headers=auth(demo_token),
+        timeout=30,
+    )
+    assert r.status_code == 404, f"expected 404 for invalid id, got {r.status_code}: {r.text}"
 
 
 # ---------- journal ----------
@@ -156,6 +201,33 @@ def test_chat_send_and_list(s, demo_token):
     assert isinstance(r2.json(), list) and len(r2.json()) >= 2
 
 
+# REGRESSION: chat must succeed 2+ times in succession
+# (verifies role='model' -> 'assistant' mapping fix in server.py ~line 488)
+def test_chat_multi_turn_regression(s, demo_token):
+    r1 = requests.post(
+        f"{BASE_URL}/api/chat",
+        json={"message": "Suggest one healthy breakfast idea."},
+        headers={**auth(demo_token), "Content-Type": "application/json"},
+        timeout=90,
+    )
+    assert r1.status_code == 200, f"first chat failed: {r1.status_code} {r1.text}"
+    d1 = r1.json()
+    assert "user_message" in d1 and "reply" in d1
+    assert len(d1["reply"]["text"]) > 0
+
+    # Second call — history now contains an assistant/'model' role message.
+    r2 = requests.post(
+        f"{BASE_URL}/api/chat",
+        json={"message": "Great — and a hydration tip?"},
+        headers={**auth(demo_token), "Content-Type": "application/json"},
+        timeout=90,
+    )
+    assert r2.status_code == 200, f"second chat failed (role mapping regression): {r2.status_code} {r2.text}"
+    d2 = r2.json()
+    assert "user_message" in d2 and "reply" in d2
+    assert len(d2["reply"]["text"]) > 0
+
+
 # ---------- insights ----------
 def test_insights(s, demo_token):
     r = requests.get(f"{BASE_URL}/api/insights", headers=auth(demo_token), timeout=120)
@@ -164,6 +236,17 @@ def test_insights(s, demo_token):
     assert "wellnessScore" in d and "recommendations" in d
     assert 0 <= d["wellnessScore"] <= 100
     assert isinstance(d["recommendations"], list) and len(d["recommendations"]) >= 1
+
+
+# REGRESSION: insights must return exactly 4 recommendations (fallback also 4)
+def test_insights_returns_four_recommendations(demo_token):
+    r = requests.get(f"{BASE_URL}/api/insights", headers=auth(demo_token), timeout=120)
+    assert r.status_code == 200
+    d = r.json()
+    recs = d.get("recommendations", [])
+    assert len(recs) == 4, f"expected 4 recommendations (incl. fallback), got {len(recs)}: {recs}"
+    for rec in recs:
+        assert "category" in rec and "title" in rec and "description" in rec
 
 
 # ---------- activity ----------

@@ -23,6 +23,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
+from bson.errors import InvalidId
 
 from emergentintegrations.llm.chat import (
     LlmChat, UserMessage, ImageContent, FileContent
@@ -240,10 +241,15 @@ async def analyze_food(
         file_contents=[ImageContent(image_base64=b64)],
     )
 
+    food_name = (data.get("foodName") or "").strip()
+    calories = float(data.get("calories", 0) or 0)
+    if calories <= 0 or food_name.lower() in ("", "not visible", "none", "no food detected", "unknown"):
+        raise HTTPException(status_code=422, detail="No food detected in the image. Please try a clearer photo.")
+
     entry = {
         "user_id": user["id"],
-        "foodName": data.get("foodName", "Meal"),
-        "calories": float(data.get("calories", 0)),
+        "foodName": food_name,
+        "calories": calories,
         "protein": float(data.get("protein", 0)),
         "carbs": float(data.get("carbs", 0)),
         "fat": float(data.get("fat", 0)),
@@ -270,7 +276,11 @@ async def list_nutrition(user: dict = Depends(get_current_user), search: Optiona
 
 @api.delete("/nutrition/{item_id}")
 async def delete_nutrition(item_id: str, user: dict = Depends(get_current_user)):
-    res = await db.nutrition.delete_one({"_id": ObjectId(item_id), "user_id": user["id"]})
+    try:
+        oid = ObjectId(item_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=404, detail="Not found")
+    res = await db.nutrition.delete_one({"_id": oid, "user_id": user["id"]})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Not found")
     return {"ok": True}
@@ -486,7 +496,8 @@ async def chat_send(payload: ChatIn, user: dict = Depends(get_current_user)):
     history_docs = await db.chat.find({"user_id": user["id"]}).sort("timestamp", -1).limit(20).to_list(20)
     history_docs = list(reversed(history_docs))[:-1]  # exclude the message we just inserted
     initial_messages = [
-        {"role": m["role"], "content": m["text"]} for m in history_docs
+        {"role": ("assistant" if m["role"] == "model" else m["role"]), "content": m["text"]}
+        for m in history_docs
     ]
 
     chat = LlmChat(
@@ -555,6 +566,9 @@ async def insights(user: dict = Depends(get_current_user)):
             "wellnessScore": 65,
             "recommendations": [
                 {"category": "STRESS", "title": "Reflect & Reset", "description": "Take 2 minutes to breathe deeply and reset your posture.", "priority": "MEDIUM"},
+                {"category": "DIET", "title": "Hydrate Mindfully", "description": "Drink a glass of water before your next meal — it aids digestion and fullness cues.", "priority": "LOW"},
+                {"category": "SLEEP", "title": "Wind-down Ritual", "description": "Dim screens 30 minutes before bed to stabilise melatonin.", "priority": "MEDIUM"},
+                {"category": "FITNESS", "title": "Micro-movement", "description": "Add a 5-minute walk after each meal — it improves post-prandial glucose.", "priority": "LOW"},
             ],
         }
 
