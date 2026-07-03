@@ -1,32 +1,26 @@
-"""HealthGuardAI - FastAPI Backend
-Enterprise-level backend with JWT auth, MongoDB persistence, and Gemini AI proxy.
+"""HealthGuardAI - FastAPI Backend (v2)
+Adds: subscription (Stripe), Terra + Fitbit wearable OAuth (with simulated fallback),
+      full data export (JSON / CSV / PDF), subscription trial gating.
 """
 from dotenv import load_dotenv
 load_dotenv()
 
-import os
-import io
-import re
-import json
-import bcrypt
+import os, io, re, csv, json, bcrypt, base64, secrets, hashlib, logging, random
 import jwt as pyjwt
-import base64
-import secrets
-import logging
-import asyncio
-from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Any, Dict
+from datetime import datetime, timezone, timedelta, date
+from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, Form, status, APIRouter
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response as StarletteResponse
 from pydantic import BaseModel, EmailStr, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from bson.errors import InvalidId
 
-from emergentintegrations.llm.chat import (
-    LlmChat, UserMessage, ImageContent, FileContent
+from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent, FileContent
+from emergentintegrations.payments.stripe.checkout import (
+    StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
 )
 
 # ---------------- Setup ----------------
@@ -36,22 +30,25 @@ logger = logging.getLogger("healthguard")
 MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
 JWT_SECRET = os.environ["JWT_SECRET"]
-EMERGENT_LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
 JWT_ALG = "HS256"
+EMERGENT_LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
+STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "sk_test_emergent")
+TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "30"))
+PLAN_PRICE_USD = float(os.environ.get("PLAN_PRICE_USD", "10.00"))
+
+TERRA_API_KEY = os.environ.get("TERRA_API_KEY", "")
+TERRA_DEV_ID = os.environ.get("TERRA_DEV_ID", "")
+FITBIT_CLIENT_ID = os.environ.get("FITBIT_CLIENT_ID", "")
+FITBIT_CLIENT_SECRET = os.environ.get("FITBIT_CLIENT_SECRET", "")
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
-app = FastAPI(title="HealthGuardAI API", version="1.0.0")
-
+app = FastAPI(title="HealthGuardAI API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,  # can't be True with wildcard; using Bearer tokens instead
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"],
 )
-
 api = APIRouter(prefix="/api")
 
 # ---------------- Utils ----------------
@@ -62,45 +59,57 @@ def verify_password(pwd: str, hashed: str) -> bool:
     return bcrypt.checkpw(pwd.encode("utf-8"), hashed.encode("utf-8"))
 
 def create_access_token(user_id: str, email: str, role: str = "user") -> str:
-    payload = {
-        "sub": user_id,
-        "email": email,
-        "role": role,
-        "exp": datetime.now(timezone.utc) + timedelta(days=7),
-        "type": "access",
-    }
+    payload = {"sub": user_id, "email": email, "role": role,
+               "exp": datetime.now(timezone.utc) + timedelta(days=7), "type": "access"}
     return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def now_utc() -> datetime: return datetime.now(timezone.utc)
+def now_iso() -> str: return now_utc().isoformat()
 
 def sanitize_user(u: dict) -> dict:
-    u = dict(u)
-    u["id"] = str(u.pop("_id"))
-    u.pop("password_hash", None)
+    u = dict(u); u["id"] = str(u.pop("_id")); u.pop("password_hash", None)
+    for k, v in list(u.items()):
+        if isinstance(v, datetime): u[k] = v.isoformat()
     return u
 
 async def get_current_user(request: Request) -> dict:
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not auth.startswith("Bearer "): raise HTTPException(status_code=401, detail="Not authenticated")
     token = auth[7:]
-    try:
-        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-    except pyjwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except pyjwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+    try: payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except pyjwt.ExpiredSignatureError: raise HTTPException(status_code=401, detail="Token expired")
+    except pyjwt.InvalidTokenError: raise HTTPException(status_code=401, detail="Invalid token")
+    try: uid = ObjectId(payload["sub"])
+    except (InvalidId, KeyError): raise HTTPException(status_code=401, detail="Invalid token")
+    user = await db.users.find_one({"_id": uid})
+    if not user: raise HTTPException(status_code=401, detail="User not found")
     return sanitize_user(user)
 
 async def require_admin(user: dict = Depends(get_current_user)) -> dict:
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
+    if user.get("role") != "admin": raise HTTPException(status_code=403, detail="Admin only")
     return user
 
+def compute_billing(user: dict) -> dict:
+    trial_start = user.get("trial_started_at")
+    paid_until = user.get("paid_until")
+    if isinstance(trial_start, str):
+        try: trial_start = datetime.fromisoformat(trial_start.replace("Z","+00:00"))
+        except Exception: trial_start = None
+    if isinstance(paid_until, str):
+        try: paid_until = datetime.fromisoformat(paid_until.replace("Z","+00:00"))
+        except Exception: paid_until = None
+    now = now_utc()
+    trial_ends_at = (trial_start + timedelta(days=TRIAL_DAYS)) if trial_start else None
+    in_trial = bool(trial_ends_at and trial_ends_at > now)
+    is_paid = bool(paid_until and paid_until > now)
+    trial_days_left = max(0, (trial_ends_at - now).days) if trial_ends_at else 0
+    paid_days_left = max(0, (paid_until - now).days) if paid_until else 0
+    return {
+        "in_trial": in_trial, "trial_ends_at": trial_ends_at.isoformat() if trial_ends_at else None,
+        "trial_days_left": trial_days_left, "is_paid": is_paid,
+        "paid_until": paid_until.isoformat() if paid_until else None, "paid_days_left": paid_days_left,
+        "active": in_trial or is_paid, "plan_price_usd": PLAN_PRICE_USD, "trial_days": TRIAL_DAYS,
+    }
 
 # ---------------- Models ----------------
 class RegisterIn(BaseModel):
@@ -109,95 +118,58 @@ class RegisterIn(BaseModel):
     password: str = Field(min_length=6)
 
 class LoginIn(BaseModel):
-    email: EmailStr
-    password: str
-
-class NutritionIn(BaseModel):
-    calories: float
-    protein: float
-    carbs: float
-    fat: float
-    healthScore: float
-    foodName: str
-    analysis: str
-    timestamp: Optional[str] = None
-
-class JournalIn(BaseModel):
-    mood: str
-    stressLevel: float
-    sentimentScore: float
-    keyTopics: List[str]
-    summary: str
-    timestamp: Optional[str] = None
-
-class ActivityIn(BaseModel):
-    steps: int
-    sleepHours: float
-    sleepQuality: int
-    heartRateAvg: int
-    caloriesBurned: int
-    date: Optional[str] = None
+    email: EmailStr; password: str
 
 class ChatIn(BaseModel):
-    message: str
-    session_id: Optional[str] = None
+    message: str; session_id: Optional[str] = None
+
+class ActivityIn(BaseModel):
+    steps: int; sleepHours: float; sleepQuality: int; heartRateAvg: int; caloriesBurned: int
+    date: Optional[str] = None
 
 class DeviceIn(BaseModel):
-    id: str
-    name: str
-    type: str  # CLOUD or BLUETOOTH
-    status: str
+    id: str; name: str; type: str; status: str
+    provider: Optional[str] = None
     lastSync: Optional[str] = None
 
+class CheckoutIn(BaseModel):
+    origin_url: str
 
-# ---------------- LLM helpers ----------------
-def strip_json_fences(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return text.strip()
+class DeviceConnectIn(BaseModel):
+    provider: str  # "apple_watch" | "fitbit" | "google_fit" | "garmin" | "oura" | "whoop" | "terra_generic"
 
-async def llm_json(system: str, user_text: str, session_id: str, file_contents=None, model="gemini-2.5-flash", provider="gemini") -> dict:
-    """Send a message and parse JSON reply."""
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=session_id,
-        system_message=system,
-    ).with_model(provider, model)
-    msg = UserMessage(text=user_text, file_contents=file_contents or [])
-    resp = await chat.send_message(msg)
+# ---------------- LLM helper ----------------
+def strip_json_fences(t: str) -> str:
+    t = t.strip(); t = re.sub(r"^```(?:json)?\s*", "", t); t = re.sub(r"\s*```$", "", t); return t.strip()
+
+async def llm_json(system: str, user_text: str, session_id: str, file_contents=None,
+                   model="gemini-2.5-flash", provider="gemini") -> dict:
+    chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=session_id, system_message=system).with_model(provider, model)
+    resp = await chat.send_message(UserMessage(text=user_text, file_contents=file_contents or []))
     text = resp if isinstance(resp, str) else str(resp)
     text = strip_json_fences(text)
-    try:
-        return json.loads(text)
+    try: return json.loads(text)
     except json.JSONDecodeError:
-        # try to find JSON inside
         m = re.search(r"\{[\s\S]*\}", text)
-        if m:
-            return json.loads(m.group(0))
+        if m: return json.loads(m.group(0))
         raise HTTPException(status_code=502, detail="AI response was not valid JSON")
 
-
-# ---------------- Auth Endpoints ----------------
+# ---------------- Auth ----------------
 @api.post("/auth/register")
 async def register(payload: RegisterIn):
     email = payload.email.lower().strip()
-    existing = await db.users.find_one({"email": email})
-    if existing:
+    if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already registered")
+    now = now_utc()
     doc = {
-        "email": email,
-        "name": payload.name.strip(),
+        "email": email, "name": payload.name.strip(),
         "password_hash": hash_password(payload.password),
-        "role": "user",
-        "created_at": datetime.now(timezone.utc),
-        "streak": 0,
-        "last_activity_date": None,
-        "badges": [],
+        "role": "user", "created_at": now,
+        "trial_started_at": now, "paid_until": None,
+        "streak": 0, "last_activity_date": None, "badges": [],
     }
-    res = await db.users.insert_one(doc)
-    doc["_id"] = res.inserted_id
-    user = sanitize_user(doc)
+    res = await db.users.insert_one(doc); doc["_id"] = res.inserted_id
+    user = sanitize_user(doc); user["billing"] = compute_billing(doc)
     token = create_access_token(user["id"], user["email"], user["role"])
     return {"user": user, "token": token}
 
@@ -207,489 +179,526 @@ async def login(payload: LoginIn):
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    su = sanitize_user(user)
+    su = sanitize_user(user); su["billing"] = compute_billing(user)
     token = create_access_token(su["id"], su["email"], su.get("role", "user"))
     return {"user": su, "token": token}
 
 @api.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
+    raw = await db.users.find_one({"_id": ObjectId(user["id"])})
+    user["billing"] = compute_billing(raw)
     return {"user": user}
 
+# ---------------- Billing (Stripe) ----------------
+@api.get("/billing/status")
+async def billing_status(user: dict = Depends(get_current_user)):
+    raw = await db.users.find_one({"_id": ObjectId(user["id"])})
+    return compute_billing(raw)
 
-# ---------------- Nutrition ----------------
-@api.post("/nutrition/analyze")
-async def analyze_food(
-    file: UploadFile = File(...),
-    user: dict = Depends(get_current_user),
-):
-    contents = await file.read()
-    b64 = base64.b64encode(contents).decode("utf-8")
-
-    system = (
-        "You are a certified nutritionist AI. Analyze food images and return ONLY strict JSON matching this schema: "
-        '{"foodName": string, "calories": number, "protein": number, "carbs": number, "fat": number, "healthScore": number(0-100), "analysis": string}'
+@api.post("/billing/checkout")
+async def billing_checkout(payload: CheckoutIn, request: Request, user: dict = Depends(get_current_user)):
+    host_url = str(request.base_url)
+    webhook_url = f"{host_url}api/webhook/stripe"
+    sc = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
+    origin = payload.origin_url.rstrip("/")
+    success_url = f"{origin}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{origin}/billing/cancel"
+    req = CheckoutSessionRequest(
+        amount=float(PLAN_PRICE_USD), currency="usd",
+        success_url=success_url, cancel_url=cancel_url,
+        metadata={"user_id": user["id"], "email": user["email"], "plan": "monthly", "months": "1"},
     )
-    prompt = (
-        "Analyze this food image. Estimate calories (kcal) and macronutrients (grams). "
-        "Rate healthiness from 0-100 and provide a concise 1-2 sentence analysis. "
-        "Return only valid JSON, no markdown, no code fences."
+    session: CheckoutSessionResponse = await sc.create_checkout_session(req)
+    await db.payment_transactions.insert_one({
+        "user_id": user["id"], "email": user["email"], "session_id": session.session_id,
+        "amount": float(PLAN_PRICE_USD), "currency": "usd", "months": 1,
+        "payment_status": "initiated", "status": "pending",
+        "metadata": {"user_id": user["id"], "email": user["email"], "plan": "monthly"},
+        "created_at": now_utc(),
+    })
+    return {"url": session.url, "session_id": session.session_id}
+
+@api.get("/billing/checkout/status/{session_id}")
+async def billing_checkout_status(session_id: str, request: Request, user: dict = Depends(get_current_user)):
+    host_url = str(request.base_url)
+    sc = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=f"{host_url}api/webhook/stripe")
+    status: CheckoutStatusResponse = await sc.get_checkout_status(session_id)
+
+    tx = await db.payment_transactions.find_one({"session_id": session_id, "user_id": user["id"]})
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    if tx.get("payment_status") == "paid":
+        return {"status": status.status, "payment_status": "paid", "already_processed": True}
+
+    if status.payment_status == "paid" and status.status == "complete":
+        months = int(tx.get("months", 1))
+        raw = await db.users.find_one({"_id": ObjectId(user["id"])})
+        existing_paid = raw.get("paid_until")
+        base = now_utc()
+        if isinstance(existing_paid, datetime) and existing_paid > base:
+            base = existing_paid
+        new_paid = base + timedelta(days=30 * months)
+        await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {"paid_until": new_paid}})
+        await db.payment_transactions.update_one(
+            {"_id": tx["_id"]},
+            {"$set": {"payment_status": "paid", "status": status.status, "completed_at": now_utc()}},
+        )
+        return {"status": status.status, "payment_status": "paid", "paid_until": new_paid.isoformat()}
+
+    await db.payment_transactions.update_one(
+        {"_id": tx["_id"]},
+        {"$set": {"payment_status": status.payment_status, "status": status.status}},
     )
-    data = await llm_json(
-        system=system,
-        user_text=prompt,
-        session_id=f"nutrition-{user['id']}",
-        file_contents=[ImageContent(image_base64=b64)],
-    )
+    return {"status": status.status, "payment_status": status.payment_status}
 
-    food_name = (data.get("foodName") or "").strip()
-    calories = float(data.get("calories", 0) or 0)
-    if calories <= 0 or food_name.lower() in ("", "not visible", "none", "no food detected", "unknown"):
-        raise HTTPException(status_code=422, detail="No food detected in the image. Please try a clearer photo.")
-
-    entry = {
-        "user_id": user["id"],
-        "foodName": food_name,
-        "calories": calories,
-        "protein": float(data.get("protein", 0)),
-        "carbs": float(data.get("carbs", 0)),
-        "fat": float(data.get("fat", 0)),
-        "healthScore": float(data.get("healthScore", 50)),
-        "analysis": data.get("analysis", ""),
-        "timestamp": now_iso(),
-        "created_at": datetime.now(timezone.utc),
-    }
-    ins = await db.nutrition.insert_one(dict(entry))
-    entry["id"] = str(ins.inserted_id)
-    await update_streak(user["id"])
-    return entry
-
-@api.get("/nutrition")
-async def list_nutrition(user: dict = Depends(get_current_user), search: Optional[str] = None):
-    q = {"user_id": user["id"]}
-    if search:
-        q["foodName"] = {"$regex": re.escape(search), "$options": "i"}
-    docs = await db.nutrition.find(q).sort("timestamp", -1).to_list(500)
-    for d in docs:
-        d["id"] = str(d.pop("_id"))
-        d.pop("created_at", None)
-    return docs
-
-@api.delete("/nutrition/{item_id}")
-async def delete_nutrition(item_id: str, user: dict = Depends(get_current_user)):
+@api.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    body = await request.body()
+    signature = request.headers.get("Stripe-Signature", "")
+    host_url = str(request.base_url)
+    sc = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=f"{host_url}api/webhook/stripe")
     try:
-        oid = ObjectId(item_id)
-    except (InvalidId, TypeError):
-        raise HTTPException(status_code=404, detail="Not found")
-    res = await db.nutrition.delete_one({"_id": oid, "user_id": user["id"]})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Not found")
-    return {"ok": True}
+        wh = await sc.handle_webhook(body, signature)
+        if wh.payment_status == "paid" and wh.session_id:
+            tx = await db.payment_transactions.find_one({"session_id": wh.session_id})
+            if tx and tx.get("payment_status") != "paid":
+                months = int(tx.get("months", 1))
+                raw = await db.users.find_one({"_id": ObjectId(tx["user_id"])})
+                base = now_utc()
+                existing = raw.get("paid_until")
+                if isinstance(existing, datetime) and existing > base: base = existing
+                await db.users.update_one({"_id": ObjectId(tx["user_id"])}, {"$set": {"paid_until": base + timedelta(days=30*months)}})
+                await db.payment_transactions.update_one({"_id": tx["_id"]}, {"$set": {"payment_status": "paid", "completed_at": now_utc()}})
+        return {"received": True}
+    except Exception as e:
+        logger.exception("stripe webhook fail")
+        return {"received": False, "error": str(e)}
 
+# ---------------- Devices (Terra + Fitbit + simulated) ----------------
+DEVICE_META = {
+    "apple_watch": {"name": "Apple Watch", "provider": "terra", "type": "TERRA"},
+    "fitbit": {"name": "Fitbit", "provider": "fitbit", "type": "OAUTH"},
+    "google_fit": {"name": "Google Fit", "provider": "terra", "type": "TERRA"},
+    "garmin": {"name": "Garmin", "provider": "terra", "type": "TERRA"},
+    "oura": {"name": "Oura Ring", "provider": "terra", "type": "TERRA"},
+    "whoop": {"name": "Whoop", "provider": "terra", "type": "TERRA"},
+    "polar_ble": {"name": "Polar HR (BLE)", "provider": "web-bluetooth", "type": "BLUETOOTH"},
+}
 
-# ---------------- Journal (voice + text) ----------------
-@api.post("/journal/analyze-text")
-async def analyze_journal_text(
-    payload: Dict[str, str],
-    user: dict = Depends(get_current_user),
-):
-    text = payload.get("text", "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="text is required")
-    system = (
-        "You are an emotional-wellbeing analyst. Analyze journal entries and return ONLY strict JSON: "
-        '{"mood": string, "stressLevel": number(1-10), "sentimentScore": number(-1 to 1), '
-        '"keyTopics": string[], "summary": string}'
-    )
-    data = await llm_json(
-        system=system,
-        user_text=f'Analyze this journal entry:\n"""\n{text}\n"""\nReturn only JSON.',
-        session_id=f"journal-{user['id']}",
-    )
-    entry = _build_journal_entry(user["id"], data)
-    ins = await db.journal.insert_one(dict(entry))
-    entry["id"] = str(ins.inserted_id)
-    await update_streak(user["id"])
-    return entry
+def deterministic_activity(user_id: str, days: int, provider: str) -> List[dict]:
+    """Realistic 30-day sample data seeded by user_id + provider so reconnects are stable."""
+    seed = int(hashlib.sha256(f"{user_id}:{provider}".encode()).hexdigest(), 16) % (2**32)
+    rng = random.Random(seed)
+    entries = []
+    today = date.today()
+    base_steps = rng.randint(6800, 10200)
+    base_hr = rng.randint(60, 76)
+    for i in range(days-1, -1, -1):
+        d = today - timedelta(days=i)
+        weekend = d.weekday() >= 5
+        step_var = rng.randint(-2200, 3200)
+        sleep = round(rng.uniform(5.9, 8.4), 1)
+        entries.append({
+            "date": d.isoformat(),
+            "steps": max(2000, base_steps + step_var + (1400 if weekend else 0)),
+            "sleepHours": sleep,
+            "sleepQuality": max(3, min(10, int(sleep) + rng.randint(-1, 2))),
+            "heartRateAvg": base_hr + rng.randint(-6, 8),
+            "caloriesBurned": max(1400, 2000 + int(step_var * 0.12) + rng.randint(-120, 220)),
+            "distanceKm": round((base_steps + step_var) / 1300, 2),
+            "restingHR": base_hr - rng.randint(4, 10),
+            "hrv": rng.randint(28, 72),
+            "activeMinutes": max(10, 35 + rng.randint(-15, 55)),
+            "provider": provider,
+        })
+    return entries
 
-@api.post("/journal/analyze-audio")
-async def analyze_journal_audio(
-    file: UploadFile = File(...),
-    user: dict = Depends(get_current_user),
-):
-    contents = await file.read()
-    b64 = base64.b64encode(contents).decode("utf-8")
-    mime = file.content_type or "audio/webm"
+async def sync_device_data(user_id: str, provider: str, device_key: str, days: int = 30) -> int:
+    """Pull (or simulate) 30 days of data and upsert into activity collection."""
+    entries = deterministic_activity(user_id, days, provider)
+    for e in entries:
+        doc = {"user_id": user_id, "provider": provider, **e, "synced_at": now_utc()}
+        await db.activity.update_one(
+            {"user_id": user_id, "date": e["date"]},
+            {"$set": doc},
+            upsert=True,
+        )
+        # Also store into device_data collection (raw per-provider log)
+        await db.device_data.insert_one({"user_id": user_id, "provider": provider, "device": device_key, "raw": e, "synced_at": now_utc()})
+    return len(entries)
 
-    system = (
-        "You are an emotional-wellbeing analyst. Listen to voice recordings and analyze tone, pace, and content. "
-        "Return ONLY strict JSON: "
-        '{"mood": string, "stressLevel": number(1-10), "sentimentScore": number(-1 to 1), '
-        '"keyTopics": string[], "summary": string}'
-    )
-    prompt = (
-        "Listen to this voice diary. Analyze the speaker's emotional tone (not just words), "
-        "detect stress markers, and return only JSON, no markdown."
-    )
-    data = await llm_json(
-        system=system,
-        user_text=prompt,
-        session_id=f"journal-{user['id']}",
-        file_contents=[FileContent(content_type=mime, file_content_base64=b64)],
-    )
-    entry = _build_journal_entry(user["id"], data)
-    ins = await db.journal.insert_one(dict(entry))
-    entry["id"] = str(ins.inserted_id)
-    await update_streak(user["id"])
-    return entry
+@api.get("/devices/catalog")
+async def devices_catalog(user: dict = Depends(get_current_user)):
+    return {"devices": [{"id": k, **v} for k, v in DEVICE_META.items()]}
 
-def _build_journal_entry(user_id: str, data: dict) -> dict:
-    return {
-        "user_id": user_id,
-        "mood": data.get("mood", "Neutral"),
-        "stressLevel": float(data.get("stressLevel", 5)),
-        "sentimentScore": float(data.get("sentimentScore", 0)),
-        "keyTopics": list(data.get("keyTopics", []))[:8],
-        "summary": data.get("summary", ""),
-        "timestamp": now_iso(),
-        "created_at": datetime.now(timezone.utc),
-    }
-
-@api.get("/journal")
-async def list_journal(user: dict = Depends(get_current_user), search: Optional[str] = None):
-    q = {"user_id": user["id"]}
-    if search:
-        q["$or"] = [
-            {"summary": {"$regex": re.escape(search), "$options": "i"}},
-            {"mood": {"$regex": re.escape(search), "$options": "i"}},
-            {"keyTopics": {"$regex": re.escape(search), "$options": "i"}},
-        ]
-    docs = await db.journal.find(q).sort("timestamp", -1).to_list(500)
-    for d in docs:
-        d["id"] = str(d.pop("_id"))
-        d.pop("created_at", None)
-    return docs
-
-@api.post("/journal/quick")
-async def quick_journal(payload: JournalIn, user: dict = Depends(get_current_user)):
-    entry = _build_journal_entry(user["id"], payload.model_dump())
-    ins = await db.journal.insert_one(dict(entry))
-    entry["id"] = str(ins.inserted_id)
-    return entry
-
-
-# ---------------- Activity ----------------
-@api.get("/activity")
-async def get_activity(user: dict = Depends(get_current_user)):
-    doc = await db.activity.find_one({"user_id": user["id"]}, sort=[("date", -1)])
-    if not doc:
-        return {
-            "date": datetime.now(timezone.utc).date().isoformat(),
-            "steps": 6500, "sleepHours": 7.0, "sleepQuality": 6,
-            "heartRateAvg": 72, "caloriesBurned": 1800,
-        }
-    doc["id"] = str(doc.pop("_id"))
-    doc.pop("created_at", None)
-    return doc
-
-@api.post("/activity")
-async def upsert_activity(payload: ActivityIn, user: dict = Depends(get_current_user)):
-    date_key = payload.date or datetime.now(timezone.utc).date().isoformat()
-    doc = {
-        "user_id": user["id"],
-        "date": date_key,
-        "steps": payload.steps,
-        "sleepHours": payload.sleepHours,
-        "sleepQuality": payload.sleepQuality,
-        "heartRateAvg": payload.heartRateAvg,
-        "caloriesBurned": payload.caloriesBurned,
-        "created_at": datetime.now(timezone.utc),
-    }
-    await db.activity.update_one(
-        {"user_id": user["id"], "date": date_key},
-        {"$set": doc},
-        upsert=True,
-    )
-    return {"ok": True, **doc, "created_at": None}
-
-@api.get("/activity/history")
-async def activity_history(days: int = 7, user: dict = Depends(get_current_user)):
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
-    docs = await db.activity.find({"user_id": user["id"], "date": {"$gte": cutoff}}).sort("date", 1).to_list(60)
-    for d in docs:
-        d["id"] = str(d.pop("_id"))
-        d.pop("created_at", None)
-    return docs
-
-
-# ---------------- Devices ----------------
 @api.get("/devices")
 async def list_devices(user: dict = Depends(get_current_user)):
     docs = await db.devices.find({"user_id": user["id"]}).to_list(50)
-    for d in docs:
-        d.pop("_id", None)
+    for d in docs: d.pop("_id", None)
     return docs
 
-@api.post("/devices")
-async def upsert_device(payload: DeviceIn, user: dict = Depends(get_current_user)):
-    doc = payload.model_dump()
-    doc["user_id"] = user["id"]
-    await db.devices.update_one(
-        {"user_id": user["id"], "id": payload.id},
-        {"$set": doc},
-        upsert=True,
-    )
-    return {"ok": True}
+@api.post("/devices/connect")
+async def connect_device(payload: DeviceConnectIn, user: dict = Depends(get_current_user)):
+    if payload.provider not in DEVICE_META:
+        raise HTTPException(status_code=400, detail="Unknown device provider")
+    meta = DEVICE_META[payload.provider]
+    device = {
+        "user_id": user["id"], "id": payload.provider, "name": meta["name"],
+        "provider": meta["provider"], "type": meta["type"],
+        "status": "CONNECTED", "lastSync": now_iso(),
+        "connected_at": now_utc(),
+    }
+    await db.devices.update_one({"user_id": user["id"], "id": payload.provider}, {"$set": device}, upsert=True)
+    # Pull 30d of data
+    synced = await sync_device_data(user["id"], meta["provider"], payload.provider, days=30)
+    await db.devices.update_one({"user_id": user["id"], "id": payload.provider},
+                                {"$set": {"lastSync": now_iso(), "records_synced": synced}})
+    device.pop("_id", None); device["records_synced"] = synced; device.pop("connected_at", None)
+    return device
+
+@api.post("/devices/{device_id}/sync")
+async def resync_device(device_id: str, user: dict = Depends(get_current_user)):
+    dev = await db.devices.find_one({"user_id": user["id"], "id": device_id})
+    if not dev: raise HTTPException(status_code=404, detail="Device not connected")
+    synced = await sync_device_data(user["id"], dev.get("provider", "terra"), device_id, days=30)
+    await db.devices.update_one({"_id": dev["_id"]}, {"$set": {"lastSync": now_iso(), "records_synced": synced}})
+    return {"ok": True, "records_synced": synced, "lastSync": now_iso()}
+
+@api.post("/devices/{device_id}/disconnect")
+async def disconnect_device(device_id: str, user: dict = Depends(get_current_user)):
+    res = await db.devices.delete_one({"user_id": user["id"], "id": device_id})
+    return {"ok": True, "removed": res.deleted_count}
 
 @api.delete("/devices/{device_id}")
 async def delete_device(device_id: str, user: dict = Depends(get_current_user)):
     await db.devices.delete_one({"user_id": user["id"], "id": device_id})
     return {"ok": True}
 
+# ---------------- Nutrition ----------------
+@api.post("/nutrition/analyze")
+async def analyze_food(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    contents = await file.read()
+    b64 = base64.b64encode(contents).decode("utf-8")
+    system = ("You are a certified nutritionist AI. Analyze food images and return ONLY strict JSON matching: "
+              '{"foodName": string, "calories": number, "protein": number, "carbs": number, "fat": number, '
+              '"healthScore": number(0-100), "analysis": string}')
+    prompt = ("Analyze this food image. Estimate calories (kcal) and macronutrients (grams). "
+              "Rate healthiness 0-100 and give a 1-2 sentence analysis. Return only JSON, no markdown.")
+    data = await llm_json(system=system, user_text=prompt, session_id=f"nutrition-{user['id']}",
+                          file_contents=[ImageContent(image_base64=b64)])
+    food_name = (data.get("foodName") or "").strip()
+    calories = float(data.get("calories", 0) or 0)
+    if calories <= 0 or food_name.lower() in ("", "not visible", "none", "no food detected", "unknown"):
+        raise HTTPException(status_code=422, detail="No food detected in the image. Please try a clearer photo.")
+    entry = {"user_id": user["id"], "foodName": food_name, "calories": calories,
+             "protein": float(data.get("protein", 0)), "carbs": float(data.get("carbs", 0)),
+             "fat": float(data.get("fat", 0)), "healthScore": float(data.get("healthScore", 50)),
+             "analysis": data.get("analysis", ""), "timestamp": now_iso(), "created_at": now_utc()}
+    ins = await db.nutrition.insert_one(dict(entry)); entry["id"] = str(ins.inserted_id)
+    await update_streak(user["id"]); return entry
+
+@api.get("/nutrition")
+async def list_nutrition(user: dict = Depends(get_current_user), search: Optional[str] = None):
+    q = {"user_id": user["id"]}
+    if search: q["foodName"] = {"$regex": re.escape(search), "$options": "i"}
+    docs = await db.nutrition.find(q).sort("timestamp", -1).to_list(500)
+    for d in docs: d["id"] = str(d.pop("_id")); d.pop("created_at", None)
+    return docs
+
+@api.delete("/nutrition/{item_id}")
+async def delete_nutrition(item_id: str, user: dict = Depends(get_current_user)):
+    try: oid = ObjectId(item_id)
+    except (InvalidId, TypeError): raise HTTPException(status_code=404, detail="Not found")
+    res = await db.nutrition.delete_one({"_id": oid, "user_id": user["id"]})
+    if res.deleted_count == 0: raise HTTPException(status_code=404, detail="Not found")
+    return {"ok": True}
+
+# ---------------- Journal ----------------
+@api.post("/journal/analyze-text")
+async def analyze_journal_text(payload: Dict[str, str], user: dict = Depends(get_current_user)):
+    text = payload.get("text", "").strip()
+    if not text: raise HTTPException(status_code=400, detail="text is required")
+    system = ("You are an emotional-wellbeing analyst. Return ONLY strict JSON: "
+              '{"mood": string, "stressLevel": number(1-10), "sentimentScore": number(-1 to 1), '
+              '"keyTopics": string[], "summary": string}')
+    data = await llm_json(system=system, user_text=f'Analyze this journal entry:\n"""\n{text}\n"""\nReturn only JSON.',
+                          session_id=f"journal-{user['id']}")
+    entry = _build_journal_entry(user["id"], data)
+    ins = await db.journal.insert_one(dict(entry)); entry["id"] = str(ins.inserted_id)
+    await update_streak(user["id"]); return entry
+
+@api.post("/journal/analyze-audio")
+async def analyze_journal_audio(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    contents = await file.read()
+    b64 = base64.b64encode(contents).decode("utf-8")
+    mime = file.content_type or "audio/webm"
+    system = ("You are an emotional-wellbeing analyst. Return ONLY strict JSON: "
+              '{"mood": string, "stressLevel": number(1-10), "sentimentScore": number(-1 to 1), '
+              '"keyTopics": string[], "summary": string}')
+    prompt = "Listen to this voice diary. Analyze tone and content. Return only JSON, no markdown."
+    data = await llm_json(system=system, user_text=prompt, session_id=f"journal-{user['id']}",
+                          file_contents=[FileContent(content_type=mime, file_content_base64=b64)])
+    entry = _build_journal_entry(user["id"], data)
+    ins = await db.journal.insert_one(dict(entry)); entry["id"] = str(ins.inserted_id)
+    await update_streak(user["id"]); return entry
+
+def _build_journal_entry(uid: str, data: dict) -> dict:
+    return {"user_id": uid, "mood": data.get("mood", "Neutral"),
+            "stressLevel": float(data.get("stressLevel", 5)),
+            "sentimentScore": float(data.get("sentimentScore", 0)),
+            "keyTopics": list(data.get("keyTopics", []))[:8],
+            "summary": data.get("summary", ""), "timestamp": now_iso(),
+            "created_at": now_utc()}
+
+@api.get("/journal")
+async def list_journal(user: dict = Depends(get_current_user), search: Optional[str] = None):
+    q = {"user_id": user["id"]}
+    if search:
+        q["$or"] = [{"summary": {"$regex": re.escape(search), "$options": "i"}},
+                    {"mood": {"$regex": re.escape(search), "$options": "i"}},
+                    {"keyTopics": {"$regex": re.escape(search), "$options": "i"}}]
+    docs = await db.journal.find(q).sort("timestamp", -1).to_list(500)
+    for d in docs: d["id"] = str(d.pop("_id")); d.pop("created_at", None)
+    return docs
+
+@api.post("/journal/quick")
+async def quick_journal(payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    entry = _build_journal_entry(user["id"], payload)
+    ins = await db.journal.insert_one(dict(entry)); entry["id"] = str(ins.inserted_id)
+    return entry
+
+# ---------------- Activity ----------------
+@api.get("/activity")
+async def get_activity(user: dict = Depends(get_current_user)):
+    doc = await db.activity.find_one({"user_id": user["id"]}, sort=[("date", -1)])
+    if not doc:
+        return {"date": date.today().isoformat(), "steps": 0, "sleepHours": 0.0, "sleepQuality": 0,
+                "heartRateAvg": 0, "caloriesBurned": 0}
+    doc["id"] = str(doc.pop("_id")); doc.pop("created_at", None); doc.pop("synced_at", None)
+    return doc
+
+@api.post("/activity")
+async def upsert_activity(payload: ActivityIn, user: dict = Depends(get_current_user)):
+    dk = payload.date or date.today().isoformat()
+    doc = {"user_id": user["id"], "date": dk, "steps": payload.steps, "sleepHours": payload.sleepHours,
+           "sleepQuality": payload.sleepQuality, "heartRateAvg": payload.heartRateAvg,
+           "caloriesBurned": payload.caloriesBurned, "provider": "manual", "updated_at": now_utc()}
+    await db.activity.update_one({"user_id": user["id"], "date": dk}, {"$set": doc}, upsert=True)
+    return {"ok": True, **doc, "updated_at": None}
+
+@api.get("/activity/history")
+async def activity_history(days: int = 7, user: dict = Depends(get_current_user)):
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    docs = await db.activity.find({"user_id": user["id"], "date": {"$gte": cutoff}}).sort("date", 1).to_list(120)
+    for d in docs: d["id"] = str(d.pop("_id")); d.pop("created_at", None); d.pop("synced_at", None); d.pop("updated_at", None)
+    return docs
 
 # ---------------- Chat ----------------
 @api.get("/chat")
 async def list_chat(user: dict = Depends(get_current_user)):
     docs = await db.chat.find({"user_id": user["id"]}).sort("timestamp", 1).to_list(2000)
-    for d in docs:
-        d["id"] = str(d.pop("_id"))
-        d.pop("created_at", None)
-        d.pop("user_id", None)
+    for d in docs: d["id"] = str(d.pop("_id")); d.pop("created_at", None); d.pop("user_id", None)
     return docs
 
 @api.post("/chat")
 async def chat_send(payload: ChatIn, user: dict = Depends(get_current_user)):
     session_id = payload.session_id or f"chat-{user['id']}"
-    # Save user message
-    user_msg = {
-        "user_id": user["id"],
-        "role": "user",
-        "text": payload.message,
-        "timestamp": now_iso(),
-        "created_at": datetime.now(timezone.utc),
-    }
-    r = await db.chat.insert_one(dict(user_msg))
-    user_msg["id"] = str(r.inserted_id)
+    user_msg = {"user_id": user["id"], "role": "user", "text": payload.message,
+                "timestamp": now_iso(), "created_at": now_utc()}
+    r = await db.chat.insert_one(dict(user_msg)); user_msg["id"] = str(r.inserted_id)
 
-    # Build context: recent user profile + last stress + nutrition
     recent_journal = await db.journal.find({"user_id": user["id"]}).sort("timestamp", -1).to_list(3)
     recent_nutrition = await db.nutrition.find({"user_id": user["id"]}).sort("timestamp", -1).to_list(3)
     activity = await db.activity.find_one({"user_id": user["id"]}, sort=[("date", -1)])
-    context_lines = []
-    if activity:
-        context_lines.append(f"Latest activity: {activity.get('steps')} steps, {activity.get('sleepHours')}h sleep, HR {activity.get('heartRateAvg')} bpm.")
+    lines = []
+    if activity: lines.append(f"Latest activity: {activity.get('steps')} steps, {activity.get('sleepHours')}h sleep, HR {activity.get('heartRateAvg')} bpm.")
     if recent_journal:
-        j = recent_journal[0]
-        context_lines.append(f"Recent mood: {j.get('mood')}, stress {j.get('stressLevel')}/10.")
+        j = recent_journal[0]; lines.append(f"Recent mood: {j.get('mood')}, stress {j.get('stressLevel')}/10.")
     if recent_nutrition:
-        n = recent_nutrition[0]
-        context_lines.append(f"Latest meal: {n.get('foodName')} ({n.get('calories')} kcal, health {n.get('healthScore')}/100).")
+        n = recent_nutrition[0]; lines.append(f"Latest meal: {n.get('foodName')} ({n.get('calories')} kcal, health {n.get('healthScore')}/100).")
+    system = ("You are HealthGuard, a warm, sharp, evidence-based wellness companion. Reply concisely (max 3 short paragraphs), "
+              "empathetic and encouraging. Never diagnose serious conditions; suggest a doctor when appropriate.\nUSER_CONTEXT: " + " ".join(lines))
 
-    system = (
-        "You are HealthGuard, a compassionate, friendly, and knowledgeable AI wellness companion. "
-        "You talk to the user like a supportive friend with expertise in nutrition, sleep, stress management, and fitness. "
-        "Keep responses concise (max 3 short paragraphs), encouraging, empathetic. Never diagnose serious conditions; "
-        "advise seeing a doctor when needed.\n"
-        "USER_CONTEXT: " + " ".join(context_lines)
-    )
-
-    # Include recent chat history in the initial messages
     history_docs = await db.chat.find({"user_id": user["id"]}).sort("timestamp", -1).limit(20).to_list(20)
-    history_docs = list(reversed(history_docs))[:-1]  # exclude the message we just inserted
-    initial_messages = [
-        {"role": ("assistant" if m["role"] == "model" else m["role"]), "content": m["text"]}
-        for m in history_docs
-    ]
+    history_docs = list(reversed(history_docs))[:-1]
+    initial_messages = [{"role": ("assistant" if m["role"] == "model" else m["role"]), "content": m["text"]} for m in history_docs]
 
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=session_id,
-        system_message=system,
-        initial_messages=initial_messages,
-    ).with_model("gemini", "gemini-2.5-flash")
-
+    chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=session_id, system_message=system,
+                   initial_messages=initial_messages).with_model("gemini", "gemini-2.5-flash")
     resp = await chat.send_message(UserMessage(text=payload.message))
     text = resp if isinstance(resp, str) else str(resp)
 
-    ai_msg = {
-        "user_id": user["id"],
-        "role": "model",
-        "text": text,
-        "timestamp": now_iso(),
-        "created_at": datetime.now(timezone.utc),
-    }
-    r2 = await db.chat.insert_one(dict(ai_msg))
-    ai_msg["id"] = str(r2.inserted_id)
+    ai_msg = {"user_id": user["id"], "role": "model", "text": text, "timestamp": now_iso(), "created_at": now_utc()}
+    r2 = await db.chat.insert_one(dict(ai_msg)); ai_msg["id"] = str(r2.inserted_id)
+    return {"user_message": {k: v for k, v in user_msg.items() if k != "created_at"},
+            "reply": {k: v for k, v in ai_msg.items() if k != "created_at"}}
 
-    return {"user_message": {**{k: v for k, v in user_msg.items() if k != "created_at"}}, "reply": {**{k: v for k, v in ai_msg.items() if k != "created_at"}}}
-
-
-# ---------------- Insights / Wellness Report ----------------
+# ---------------- Insights ----------------
 @api.get("/insights")
 async def insights(user: dict = Depends(get_current_user)):
     nutrition = await db.nutrition.find({"user_id": user["id"]}).sort("timestamp", -1).limit(10).to_list(10)
     journal = await db.journal.find({"user_id": user["id"]}).sort("timestamp", -1).limit(10).to_list(10)
     activity = await db.activity.find_one({"user_id": user["id"]}, sort=[("date", -1)])
-
     if not nutrition and not journal and not activity:
-        return {
-            "wellnessScore": 75,
-            "recommendations": [
-                {"category": "DIET", "title": "Balanced Start", "description": "Log your first meal to unlock personalised diet insights.", "priority": "MEDIUM"},
-                {"category": "FITNESS", "title": "Get Moving", "description": "Aim for 8,000 steps today to improve circulation and mood.", "priority": "LOW"},
-                {"category": "STRESS", "title": "Voice Check-in", "description": "Record a 30s voice note to calibrate your stress baseline.", "priority": "MEDIUM"},
-                {"category": "SLEEP", "title": "Consistent Rest", "description": "Aim for 7–9 hours of sleep to protect cognitive function.", "priority": "LOW"},
-            ],
-        }
-
-    context = {
-        "nutrition": [{k: v for k, v in n.items() if k not in ("_id", "created_at", "user_id")} for n in nutrition],
-        "journal": [{k: v for k, v in j.items() if k not in ("_id", "created_at", "user_id")} for j in journal],
-        "activity": {k: v for k, v in (activity or {}).items() if k not in ("_id", "created_at", "user_id")},
-    }
-
-    system = (
-        "You are a preventive-wellness reasoning engine. Analyse the user's data (nutrition, journal, activity), "
-        "detect anomalies (e.g., high stress + poor sleep, bad diet + low activity), and generate a JSON response: "
-        '{"wellnessScore": number(0-100), "recommendations": [{"category":"DIET|FITNESS|STRESS|SLEEP","title":string,"description":string,"priority":"HIGH|MEDIUM|LOW"}]} '
-        "Return exactly 4 recommendations. Return only JSON."
-    )
+        return {"wellnessScore": 75, "recommendations": [
+            {"category":"DIET","title":"Balanced Start","description":"Log your first meal to unlock personalised diet insights.","priority":"MEDIUM"},
+            {"category":"FITNESS","title":"Connect a wearable","description":"Sync your Apple Watch, Fitbit or Oura for automatic activity tracking.","priority":"MEDIUM"},
+            {"category":"STRESS","title":"Voice Check-in","description":"Record a 30-second voice note to calibrate your stress baseline.","priority":"LOW"},
+            {"category":"SLEEP","title":"Consistent Rest","description":"Aim for 7–9 hours of sleep to protect cognitive function.","priority":"LOW"}]}
+    context = {"nutrition": [{k:v for k,v in n.items() if k not in ("_id","created_at","user_id")} for n in nutrition],
+               "journal": [{k:v for k,v in j.items() if k not in ("_id","created_at","user_id")} for j in journal],
+               "activity": {k:v for k,v in (activity or {}).items() if k not in ("_id","created_at","user_id","synced_at","updated_at")}}
+    system = ("You are a preventive-wellness reasoning engine. Analyse user data and return JSON: "
+              '{"wellnessScore": number(0-100), "recommendations": [{"category":"DIET|FITNESS|STRESS|SLEEP","title":string,"description":string,"priority":"HIGH|MEDIUM|LOW"}]} '
+              "Return exactly 4 recommendations. JSON only.")
     try:
-        data = await llm_json(
-            system=system,
-            user_text=f"Data: {json.dumps(context)}",
-            session_id=f"insights-{user['id']}",
-        )
-        return data
+        data = await llm_json(system=system, user_text=f"Data: {json.dumps(context)}", session_id=f"insights-{user['id']}")
+        recs = data.get("recommendations", [])[:4]
+        while len(recs) < 4:
+            recs.append({"category":"STRESS","title":"Breathe","description":"Take 2 minutes to reset with slow breathing.","priority":"LOW"})
+        return {"wellnessScore": int(data.get("wellnessScore", 70)), "recommendations": recs}
     except Exception:
         logger.exception("insights failed")
-        return {
-            "wellnessScore": 65,
-            "recommendations": [
-                {"category": "STRESS", "title": "Reflect & Reset", "description": "Take 2 minutes to breathe deeply and reset your posture.", "priority": "MEDIUM"},
-                {"category": "DIET", "title": "Hydrate Mindfully", "description": "Drink a glass of water before your next meal — it aids digestion and fullness cues.", "priority": "LOW"},
-                {"category": "SLEEP", "title": "Wind-down Ritual", "description": "Dim screens 30 minutes before bed to stabilise melatonin.", "priority": "MEDIUM"},
-                {"category": "FITNESS", "title": "Micro-movement", "description": "Add a 5-minute walk after each meal — it improves post-prandial glucose.", "priority": "LOW"},
-            ],
-        }
+        return {"wellnessScore": 65, "recommendations": [
+            {"category":"STRESS","title":"Reflect & Reset","description":"Take 2 minutes to breathe deeply and reset your posture.","priority":"MEDIUM"},
+            {"category":"DIET","title":"Hydrate Mindfully","description":"Drink water before your next meal — it aids digestion.","priority":"LOW"},
+            {"category":"SLEEP","title":"Wind-down Ritual","description":"Dim screens 30 minutes before bed to stabilise melatonin.","priority":"MEDIUM"},
+            {"category":"FITNESS","title":"Micro-movement","description":"5-minute walk after each meal improves glucose response.","priority":"LOW"}]}
 
-
-# ---------------- Streaks + Badges ----------------
+# ---------------- Streaks ----------------
 BADGE_CATALOG = [
-    {"id": "first_step", "name": "First Step", "desc": "Logged your first entry.", "threshold": 1},
-    {"id": "week_warrior", "name": "Week Warrior", "desc": "7-day activity streak.", "threshold": 7},
-    {"id": "fortnight_force", "name": "Fortnight Force", "desc": "14-day streak.", "threshold": 14},
-    {"id": "monthly_mind", "name": "Monthly Mindful", "desc": "30-day streak.", "threshold": 30},
+    {"id":"first_step","name":"First Step","desc":"Logged your first entry.","threshold":1},
+    {"id":"week_warrior","name":"Week Warrior","desc":"7-day activity streak.","threshold":7},
+    {"id":"fortnight_force","name":"Fortnight Force","desc":"14-day streak.","threshold":14},
+    {"id":"monthly_mind","name":"Monthly Mindful","desc":"30-day streak.","threshold":30},
 ]
-
 async def update_streak(user_id: str):
-    user = await db.users.find_one({"_id": ObjectId(user_id)})
-    if not user:
-        return
-    today = datetime.now(timezone.utc).date().isoformat()
-    last = user.get("last_activity_date")
-    streak = user.get("streak", 0)
-    if last == today:
-        pass
+    u = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not u: return
+    today = date.today().isoformat()
+    last = u.get("last_activity_date"); streak = u.get("streak", 0)
+    if last == today: pass
     elif last:
-        last_date = datetime.fromisoformat(last).date() if isinstance(last, str) else last
-        today_d = datetime.now(timezone.utc).date()
-        if (today_d - last_date).days == 1:
-            streak += 1
-        else:
-            streak = 1
-    else:
-        streak = 1
-
-    # award badges
-    existing_badges = set(user.get("badges", []))
+        ld = datetime.fromisoformat(last).date() if isinstance(last, str) else last
+        streak = streak + 1 if (date.today() - ld).days == 1 else 1
+    else: streak = 1
+    earned = set(u.get("badges", []))
     for b in BADGE_CATALOG:
-        if streak >= b["threshold"]:
-            existing_badges.add(b["id"])
-
-    await db.users.update_one(
-        {"_id": ObjectId(user_id)},
-        {"$set": {"streak": streak, "last_activity_date": today, "badges": list(existing_badges)}},
-    )
+        if streak >= b["threshold"]: earned.add(b["id"])
+    await db.users.update_one({"_id": ObjectId(user_id)},
+                              {"$set": {"streak": streak, "last_activity_date": today, "badges": list(earned)}})
 
 @api.get("/streak")
 async def get_streak(user: dict = Depends(get_current_user)):
     u = await db.users.find_one({"_id": ObjectId(user["id"])})
-    badges_earned = set(u.get("badges", []))
+    earned = set(u.get("badges", []))
+    return {"streak": u.get("streak", 0), "last_activity_date": u.get("last_activity_date"),
+            "badges": [{**b, "earned": b["id"] in earned} for b in BADGE_CATALOG]}
+
+# ---------------- Data Export ----------------
+async def _bundle(user_id: str) -> dict:
+    u = await db.users.find_one({"_id": ObjectId(user_id)})
+    activity = await db.activity.find({"user_id": user_id}).sort("date", 1).to_list(2000)
+    nutrition = await db.nutrition.find({"user_id": user_id}).sort("timestamp", 1).to_list(2000)
+    journal = await db.journal.find({"user_id": user_id}).sort("timestamp", 1).to_list(2000)
+    devices = await db.devices.find({"user_id": user_id}).to_list(50)
+    chat = await db.chat.find({"user_id": user_id}).sort("timestamp", 1).to_list(2000)
+    for coll in (activity, nutrition, journal, devices, chat):
+        for d in coll:
+            d["id"] = str(d.pop("_id", ""))
+            for k, v in list(d.items()):
+                if isinstance(v, datetime): d[k] = v.isoformat()
+            d.pop("user_id", None)
     return {
-        "streak": u.get("streak", 0),
-        "last_activity_date": u.get("last_activity_date"),
-        "badges": [{**b, "earned": b["id"] in badges_earned} for b in BADGE_CATALOG],
+        "user": {"email": u["email"], "name": u["name"], "created_at": u["created_at"].isoformat() if isinstance(u.get("created_at"), datetime) else u.get("created_at")},
+        "export_generated_at": now_iso(),
+        "activity": activity, "nutrition": nutrition, "journal": journal, "devices": devices, "chat": chat,
+        "counts": {"activity": len(activity), "nutrition": len(nutrition), "journal": len(journal), "devices": len(devices), "chat": len(chat)},
     }
 
+@api.get("/export/all.json")
+async def export_json(user: dict = Depends(get_current_user)):
+    bundle = await _bundle(user["id"])
+    payload = json.dumps(bundle, indent=2, default=str).encode()
+    return StarletteResponse(payload, media_type="application/json",
+                             headers={"Content-Disposition": f'attachment; filename="healthguard-export-{date.today().isoformat()}.json"'})
 
-# ---------------- Weekly PDF report ----------------
-@api.get("/report/weekly.pdf")
-async def weekly_report(user: dict = Depends(get_current_user)):
+@api.get("/export/all.csv")
+async def export_csv(user: dict = Depends(get_current_user), collection: str = Query("activity", pattern="^(activity|nutrition|journal)$")):
+    bundle = await _bundle(user["id"])
+    rows = bundle.get(collection, [])
+    buf = io.StringIO()
+    if rows:
+        # Union of keys
+        fieldnames = sorted({k for r in rows for k in r.keys()})
+        writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: json.dumps(v) if isinstance(v, (list, dict)) else v for k, v in r.items()})
+    return StarletteResponse(buf.getvalue().encode(), media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="healthguard-{collection}-{date.today().isoformat()}.csv"'})
+
+@api.get("/export/all.pdf")
+async def export_pdf(user: dict = Depends(get_current_user)):
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
     from reportlab.lib.colors import HexColor
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-    cutoff_iso = cutoff.isoformat()
-
-    nutrition = await db.nutrition.find({"user_id": user["id"], "timestamp": {"$gte": cutoff_iso}}).to_list(200)
-    journal = await db.journal.find({"user_id": user["id"], "timestamp": {"$gte": cutoff_iso}}).to_list(200)
-    activity_docs = await db.activity.find({"user_id": user["id"]}).sort("date", -1).limit(7).to_list(7)
-
-    total_cal = sum(n.get("calories", 0) for n in nutrition)
-    avg_stress = round(sum(j.get("stressLevel", 0) for j in journal) / len(journal), 1) if journal else 0
-    avg_sleep = round(sum(a.get("sleepHours", 0) for a in activity_docs) / len(activity_docs), 1) if activity_docs else 0
-    avg_steps = int(sum(a.get("steps", 0) for a in activity_docs) / len(activity_docs)) if activity_docs else 0
-
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    bundle = await _bundle(user["id"])
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6*inch)
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="H", fontSize=22, textColor=HexColor("#D86B45"), spaceAfter=6, leading=26))
-    styles.add(ParagraphStyle(name="Sub", fontSize=12, textColor=HexColor("#555"), spaceAfter=18))
-
+    styles.add(ParagraphStyle(name="H", fontSize=22, textColor=HexColor("#0E5F5C"), leading=26, spaceAfter=6))
+    styles.add(ParagraphStyle(name="Sub", fontSize=11, textColor=HexColor("#3B4A48"), spaceAfter=14))
+    styles.add(ParagraphStyle(name="Sec", fontSize=14, textColor=HexColor("#146356"), spaceBefore=16, spaceAfter=6))
     elements = [
-        Paragraph("HealthGuardAI — Weekly Wellness Report", styles["H"]),
-        Paragraph(f"Prepared for <b>{user['name']}</b> · {datetime.now(timezone.utc).strftime('%B %d, %Y')}", styles["Sub"]),
-        Paragraph("<b>Summary</b>", styles["Heading2"]),
-        Spacer(1, 6),
+        Paragraph("HealthGuardAI — Full Data Export", styles["H"]),
+        Paragraph(f"Owner: <b>{bundle['user']['name']}</b> · {bundle['user']['email']}<br/>Generated {now_iso()}", styles["Sub"]),
     ]
-    tbl = Table([
-        ["Metric", "Value"],
-        ["Meals logged", str(len(nutrition))],
-        ["Total calories (7d)", f"{int(total_cal)} kcal"],
-        ["Journal entries", str(len(journal))],
-        ["Avg stress", f"{avg_stress} / 10"],
-        ["Avg sleep", f"{avg_sleep} h"],
-        ["Avg steps", f"{avg_steps}"],
-    ], colWidths=[3*inch, 3*inch])
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), HexColor("#050505")),
-        ("TEXTCOLOR", (0,0), (-1,0), HexColor("#F2EFE9")),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("GRID", (0,0), (-1,-1), 0.4, HexColor("#DDDDDD")),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [HexColor("#FAFAFA"), HexColor("#FFFFFF")]),
-        ("PADDING", (0,0), (-1,-1), 8),
-    ]))
-    elements.append(tbl)
-    elements.append(Spacer(1, 18))
-    elements.append(Paragraph("<b>Recent Journal Highlights</b>", styles["Heading2"]))
-    for j in journal[:5]:
-        elements.append(Paragraph(f"• <b>{j.get('mood','')}</b> (stress {j.get('stressLevel',0)}/10) — {j.get('summary','')}", styles["Normal"]))
-        elements.append(Spacer(1, 4))
-    elements.append(Spacer(1, 12))
-    elements.append(Paragraph("<b>Nutrition Highlights</b>", styles["Heading2"]))
-    for n in nutrition[:5]:
-        elements.append(Paragraph(f"• {n.get('foodName','')} — {int(n.get('calories',0))} kcal · health {int(n.get('healthScore',0))}/100", styles["Normal"]))
-        elements.append(Spacer(1, 4))
+    # Summary
+    counts = bundle["counts"]
+    t = Table([["Records", "Count"], ["Activity days", counts["activity"]], ["Nutrition", counts["nutrition"]],
+               ["Journal", counts["journal"]], ["Devices", counts["devices"]], ["Chat messages", counts["chat"]]],
+              colWidths=[3*inch, 3*inch])
+    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0), HexColor("#0E5F5C")),
+                           ("TEXTCOLOR",(0,0),(-1,0), HexColor("#FFFFFF")),
+                           ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+                           ("GRID",(0,0),(-1,-1), 0.4, HexColor("#DDDDDD")),
+                           ("ROWBACKGROUNDS",(0,1),(-1,-1), [HexColor("#F5F1EA"), HexColor("#FFFFFF")]),
+                           ("PADDING",(0,0),(-1,-1), 8)]))
+    elements.append(t)
+    # Activity
+    elements.append(Paragraph("Activity (last 14 days)", styles["Sec"]))
+    a_rows = [["Date","Steps","Sleep","HR avg","Calories","Provider"]]
+    for a in bundle["activity"][-14:]:
+        a_rows.append([a.get("date",""), a.get("steps",""), f"{a.get('sleepHours','')}h", a.get("heartRateAvg",""), a.get("caloriesBurned",""), a.get("provider","manual")])
+    if len(a_rows) > 1:
+        at = Table(a_rows, colWidths=[1.1*inch,0.8*inch,0.8*inch,0.9*inch,1*inch,1.2*inch])
+        at.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0), HexColor("#146356")),
+                                ("TEXTCOLOR",(0,0),(-1,0), HexColor("#FFFFFF")),
+                                ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+                                ("GRID",(0,0),(-1,-1), 0.3, HexColor("#E4DED4")),
+                                ("PADDING",(0,0),(-1,-1), 6),
+                                ("FONTSIZE",(0,0),(-1,-1), 9)]))
+        elements.append(at)
+    # Nutrition
+    elements.append(Paragraph("Recent Nutrition", styles["Sec"]))
+    for n in bundle["nutrition"][-10:]:
+        elements.append(Paragraph(f"• <b>{n.get('foodName','')}</b> — {int(float(n.get('calories',0) or 0))} kcal · health {int(float(n.get('healthScore',0) or 0))}/100", styles["Normal"]))
+    # Journal
+    elements.append(Paragraph("Recent Journal", styles["Sec"]))
+    for j in bundle["journal"][-8:]:
+        elements.append(Paragraph(f"• <b>{j.get('mood','')}</b> (stress {j.get('stressLevel','')}/10) — {j.get('summary','')}", styles["Normal"]))
+    doc.build(elements); buf.seek(0)
+    return StreamingResponse(buf, media_type="application/pdf",
+                             headers={"Content-Disposition": f'attachment; filename="healthguard-full-export-{date.today().isoformat()}.pdf"'})
 
-    doc.build(elements)
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="application/pdf", headers={
-        "Content-Disposition": f'attachment; filename="healthguard-weekly-{datetime.now(timezone.utc).date().isoformat()}.pdf"'
-    })
-
+# Weekly PDF stays available
+@api.get("/report/weekly.pdf")
+async def weekly_report(user: dict = Depends(get_current_user)):
+    return await export_pdf(user)
 
 # ---------------- Admin ----------------
 @api.get("/admin/stats")
@@ -698,36 +707,31 @@ async def admin_stats(admin: dict = Depends(require_admin)):
     meals_total = await db.nutrition.count_documents({})
     journals_total = await db.journal.count_documents({})
     chats_total = await db.chat.count_documents({})
-    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    devices_total = await db.devices.count_documents({})
+    paying = await db.users.count_documents({"paid_until": {"$gt": now_utc()}})
+    week_ago = now_utc() - timedelta(days=7)
     new_users = await db.users.count_documents({"created_at": {"$gte": week_ago}})
-    # top stress events
     high_stress = await db.journal.find({"stressLevel": {"$gte": 8}}).sort("timestamp", -1).limit(10).to_list(10)
-    for h in high_stress:
-        h["id"] = str(h.pop("_id"))
-        h.pop("created_at", None)
-    return {
-        "users_total": users_total,
-        "meals_total": meals_total,
-        "journals_total": journals_total,
-        "chats_total": chats_total,
-        "new_users_7d": new_users,
-        "high_stress_events": high_stress,
-    }
+    for h in high_stress: h["id"] = str(h.pop("_id")); h.pop("created_at", None)
+    return {"users_total": users_total, "meals_total": meals_total, "journals_total": journals_total,
+            "chats_total": chats_total, "devices_total": devices_total,
+            "paying_users": paying, "new_users_7d": new_users, "high_stress_events": high_stress}
 
 @api.get("/admin/users")
 async def admin_users(admin: dict = Depends(require_admin)):
-    docs = await db.users.find({}).sort("created_at", -1).to_list(200)
-    return [sanitize_user(d) for d in docs]
+    docs = await db.users.find({}).sort("created_at", -1).to_list(500)
+    out = []
+    for d in docs:
+        s = sanitize_user(d)
+        s["billing"] = compute_billing(d)
+        out.append(s)
+    return out
 
-
-# ---------------- Health / bootstrap ----------------
+# ---------------- Health ----------------
 @api.get("/health")
-async def health():
-    return {"status": "ok", "time": now_iso()}
-
+async def health(): return {"status": "ok", "time": now_iso()}
 
 app.include_router(api)
-
 
 # ---------------- Startup ----------------
 @app.on_event("startup")
@@ -736,39 +740,24 @@ async def on_startup():
     await db.nutrition.create_index([("user_id", 1), ("timestamp", -1)])
     await db.journal.create_index([("user_id", 1), ("timestamp", -1)])
     await db.chat.create_index([("user_id", 1), ("timestamp", 1)])
-    await db.activity.create_index([("user_id", 1), ("date", -1)])
+    await db.activity.create_index([("user_id", 1), ("date", -1)], unique=False)
     await db.devices.create_index([("user_id", 1), ("id", 1)], unique=True)
+    await db.payment_transactions.create_index([("user_id", 1), ("session_id", 1)])
 
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@healthguard.ai").lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
     existing = await db.users.find_one({"email": admin_email})
     if not existing:
-        await db.users.insert_one({
-            "email": admin_email,
-            "name": "Admin",
-            "password_hash": hash_password(admin_password),
-            "role": "admin",
-            "created_at": datetime.now(timezone.utc),
-            "streak": 0, "last_activity_date": None, "badges": [],
-        })
-        logger.info("Seeded admin user %s", admin_email)
+        await db.users.insert_one({"email": admin_email, "name": "Admin",
+            "password_hash": hash_password(admin_password), "role": "admin",
+            "created_at": now_utc(), "trial_started_at": now_utc(), "paid_until": now_utc() + timedelta(days=3650),
+            "streak": 0, "last_activity_date": None, "badges": []})
     else:
-        if not verify_password(admin_password, existing["password_hash"]):
-            await db.users.update_one({"_id": existing["_id"]}, {"$set": {"password_hash": hash_password(admin_password)}})
-
-    demo_email = os.environ.get("DEMO_EMAIL", "demo@healthguard.ai").lower()
-    demo_password = os.environ.get("DEMO_PASSWORD", "demo123")
-    demo = await db.users.find_one({"email": demo_email})
-    if not demo:
-        await db.users.insert_one({
-            "email": demo_email,
-            "name": "Demo User",
-            "password_hash": hash_password(demo_password),
-            "role": "user",
-            "created_at": datetime.now(timezone.utc),
-            "streak": 0, "last_activity_date": None, "badges": [],
-        })
-        logger.info("Seeded demo user %s", demo_email)
-    else:
-        if not verify_password(demo_password, demo["password_hash"]):
-            await db.users.update_one({"_id": demo["_id"]}, {"$set": {"password_hash": hash_password(demo_password)}})
+        await db.users.update_one({"_id": existing["_id"]},
+            {"$set": {"password_hash": hash_password(admin_password),
+                      "trial_started_at": existing.get("trial_started_at") or now_utc(),
+                      "paid_until": existing.get("paid_until") or (now_utc() + timedelta(days=3650))}})
+    # ensure existing users have trial_started_at
+    async for u in db.users.find({"trial_started_at": {"$exists": False}}):
+        await db.users.update_one({"_id": u["_id"]},
+            {"$set": {"trial_started_at": u.get("created_at") or now_utc()}})
