@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { useAuth } from './context/AuthContext.jsx'
+import { motion, AnimatePresence } from 'framer-motion'
 import AuthScreen from './components/AuthScreen.jsx'
 import Sidebar from './components/Sidebar.jsx'
 import TopBar from './components/TopBar.jsx'
@@ -11,11 +12,23 @@ import AIChat from './components/AIChat.jsx'
 import Guide from './components/Guide.jsx'
 import AdminPanel from './components/AdminPanel.jsx'
 import Billing from './components/Billing.jsx'
-import ExportPanel from './components/ExportPanel.jsx'
 import NightlyCheckIn from './components/NightlyCheckIn.jsx'
 import Toast from './components/Toast.jsx'
 import TrialBanner from './components/TrialBanner.jsx'
 import { api } from './lib/api.js'
+
+const ExportPanel = () => (
+  <div className="p-10 text-center text-muted">
+    <div className="text-sm text-ink2">Export panel coming soon.</div>
+  </div>
+)
+
+const tabTransition = {
+  initial: { opacity: 0, y: 10 },
+  animate: { opacity: 1, y: 0 },
+  exit: { opacity: 0, y: -10 },
+  transition: { duration: 0.35, ease: [0.16, 1, 0.3, 1] }
+}
 
 export default function App() {
   const { user, billing, loading, logout, refreshBilling } = useAuth()
@@ -152,38 +165,66 @@ export default function App() {
   return (
     <div className="min-h-screen bg-bg text-ink flex" data-testid="app-shell">
       <Sidebar tab={tab} onChange={setTab} onLogout={logout} onOpenCheckIn={() => setShowCheckIn(true)}
-               isAdmin={isAdmin} streak={streak.streak} user={user} billing={billing} />
+               isAdmin={isAdmin} streak={streak.streak} user={user} billing={billing} devices={devices} />
 
       <main className="flex-1 relative md:pl-72 pb-24 md:pb-0">
         <TopBar tab={tab} user={user} loading={loadingInsights} streak={streak.streak}
-                score={insights.wellnessScore} billing={billing} onOpenBilling={() => setTab('BILLING')} />
+                score={insights.wellnessScore} billing={billing} onOpenBilling={() => setTab('BILLING')} onLogout={logout} />
         <TrialBanner billing={billing} onOpen={() => setTab('BILLING')} />
 
         <div className="px-5 md:px-10 py-6">
-          {tab === 'DASHBOARD' && (
-            <Dashboard insights={insights} activity={activity} nutrition={nutrition}
-                       journal={journal} streak={streak} onChangeTab={setTab}
-                       loadingInsights={loadingInsights} devices={devices} />
-          )}
-          {tab === 'NUTRITION' && (
-            <NutritionTracker entries={nutrition} onAdded={handleNutritionAdded} onRefresh={loadAll} disabled={!trialActive} />
-          )}
-          {tab === 'JOURNAL' && (
-            <VoiceJournal entries={journal} onAdded={handleJournalAdded} disabled={!trialActive} />
-          )}
-          {tab === 'ACTIVITY' && (
-            <ActivityLog data={activity} devices={devices} onUpdate={handleActivityUpdate}
-                         onConnect={handleDeviceConnect} onDisconnect={handleDeviceDisconnect}
-                         onResync={handleDeviceResync}
-                         onBluetoothData={(hr) => setActivity(prev => prev ? { ...prev, heartRateAvg: hr } : prev)} />
-          )}
-          {tab === 'CHAT' && (
-            <AIChat messages={chat} onSend={handleChatSend} disabled={!trialActive} />
-          )}
-          {tab === 'EXPORT' && <ExportPanel />}
-          {tab === 'BILLING' && <Billing />}
-          {tab === 'GUIDE' && <Guide onChangeTab={setTab} />}
-          {tab === 'ADMIN' && isAdmin && <AdminPanel />}
+          <AnimatePresence mode="wait">
+            {tab === 'DASHBOARD' && (
+              <motion.div key="dashboard" {...tabTransition}>
+                <Dashboard insights={insights} activity={activity} nutrition={nutrition}
+                           journal={journal} streak={streak} onChangeTab={setTab}
+                           loadingInsights={loadingInsights} devices={devices} />
+              </motion.div>
+            )}
+            {tab === 'NUTRITION' && (
+              <motion.div key="nutrition" {...tabTransition}>
+                <NutritionTracker entries={nutrition} onAdded={handleNutritionAdded} onRefresh={loadAll} disabled={!trialActive} />
+              </motion.div>
+            )}
+            {tab === 'JOURNAL' && (
+              <motion.div key="journal" {...tabTransition}>
+                <VoiceJournal entries={journal} onAdded={handleJournalAdded} disabled={!trialActive} />
+              </motion.div>
+            )}
+            {tab === 'ACTIVITY' && (
+              <motion.div key="activity" {...tabTransition}>
+                <ActivityLog data={activity} devices={devices} onUpdate={handleActivityUpdate}
+                             onConnect={handleDeviceConnect} onDisconnect={handleDeviceDisconnect}
+                             onResync={handleDeviceResync}
+                             onBluetoothData={(hr) => setActivity(prev => prev ? { ...prev, heartRateAvg: hr } : prev)} />
+              </motion.div>
+            )}
+            {tab === 'CHAT' && (
+              <motion.div key="chat" {...tabTransition}>
+                <AIChat messages={chat} onSend={handleChatSend} disabled={!trialActive} />
+              </motion.div>
+            )}
+            {tab === 'EXPORT' && (
+              <motion.div key="export" {...tabTransition}>
+                <ExportPanel />
+              </motion.div>
+            )}
+            {tab === 'BILLING' && (
+              <motion.div key="billing" {...tabTransition}>
+                <Billing />
+              </motion.div>
+            )}
+            {tab === 'GUIDE' && (
+              <motion.div key="guide" {...tabTransition}>
+                <Guide onChangeTab={setTab} />
+              </motion.div>
+            )}
+            {tab === 'ADMIN' && isAdmin && (
+              <motion.div key="admin" {...tabTransition}>
+                <AdminPanel />
+              </motion.div>
+            )}
+          </AnimatePresence>
         </div>
       </main>
 
