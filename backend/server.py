@@ -166,6 +166,12 @@ def compute_billing(user: dict) -> dict:
     if isinstance(paid_until, str):
         try: paid_until = datetime.fromisoformat(paid_until.replace("Z","+00:00"))
         except Exception: paid_until = None
+    # Datetimes read back from MongoDB are timezone-naive; treat them as UTC so
+    # they can be compared against an offset-aware "now" without a TypeError.
+    if isinstance(trial_start, datetime) and trial_start.tzinfo is None:
+        trial_start = trial_start.replace(tzinfo=timezone.utc)
+    if isinstance(paid_until, datetime) and paid_until.tzinfo is None:
+        paid_until = paid_until.replace(tzinfo=timezone.utc)
     now = now_utc()
     trial_ends_at = (trial_start + timedelta(days=TRIAL_DAYS)) if trial_start else None
     in_trial = bool(trial_ends_at and trial_ends_at > now)
