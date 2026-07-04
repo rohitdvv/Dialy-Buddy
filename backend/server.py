@@ -10,7 +10,7 @@ import jwt as pyjwt
 from datetime import datetime, timezone, timedelta, date
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, APIRouter, Query
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, APIRouter, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response as StarletteResponse
 from pydantic import BaseModel, EmailStr, Field
@@ -18,10 +18,34 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from bson.errors import InvalidId
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent, FileContent
-from emergentintegrations.payments.stripe.checkout import (
-    StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
-)
+try:
+    from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent, FileContent
+    from emergentintegrations.payments.stripe.checkout import (
+        StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+    )
+except Exception:
+    # Stub imports for environments without emergentintegrations
+    class LlmChat:  # type: ignore
+        def __init__(self, *a, **k): pass
+        def with_model(self, *a, **k): return self
+        async def send_message(self, *a, **k): return "{}"
+    class UserMessage:  # type: ignore
+        def __init__(self, text=None, file_contents=None): pass
+    class ImageContent:  # type: ignore
+        def __init__(self, image_base64=None): pass
+    class FileContent:  # type: ignore
+        def __init__(self, content_type=None, file_content_base64=None): pass
+    class StripeCheckout:  # type: ignore
+        def __init__(self, *a, **k): pass
+        async def create_checkout_session(self, *a, **k): return type("R", (), {"session_id": "", "url": ""})()
+        async def get_checkout_status(self, *a, **k): return type("R", (), {"status": "", "payment_status": ""})()
+        async def handle_webhook(self, *a, **k): return type("R", (), {"payment_status": "", "session_id": ""})()
+    class CheckoutSessionResponse:  # type: ignore
+        pass
+    class CheckoutStatusResponse:  # type: ignore
+        pass
+    class CheckoutSessionRequest:  # type: ignore
+        pass
 
 # ---------------- Setup ----------------
 logging.basicConfig(level=logging.INFO)
@@ -89,6 +113,22 @@ async def require_admin(user: dict = Depends(get_current_user)) -> dict:
     if user.get("role") != "admin": raise HTTPException(status_code=403, detail="Admin only")
     return user
 
+async def require_subscription(user: dict = Depends(get_current_user)) -> dict:
+    raw = await db.users.find_one({"_id": ObjectId(user["id"])})
+    billing = compute_billing(raw)
+    if not billing["active"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "detail": "Subscription required",
+                "subscription_required": True,
+                "trial_days_left": billing["trial_days_left"],
+                "paid_days_left": billing["paid_days_left"],
+                "plan_price_usd": PLAN_PRICE_USD,
+            }
+        )
+    return user
+
 def compute_billing(user: dict) -> dict:
     trial_start = user.get("trial_started_at")
     paid_until = user.get("paid_until")
@@ -125,6 +165,10 @@ class ChatIn(BaseModel):
 
 class ActivityIn(BaseModel):
     steps: int; sleepHours: float; sleepQuality: int; heartRateAvg: int; caloriesBurned: int
+    distanceKm: Optional[float] = None
+    restingHR: Optional[int] = None
+    hrv: Optional[int] = None
+    activeMinutes: Optional[int] = None
     date: Optional[str] = None
 
 class DeviceIn(BaseModel):
@@ -181,6 +225,19 @@ async def login(payload: LoginIn):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     su = sanitize_user(user); su["billing"] = compute_billing(user)
     token = create_access_token(su["id"], su["email"], su.get("role", "user"))
+    # Auto-reconnect previously connected devices
+    prev_connections = await db.device_connections.find(
+        {"user_id": su["id"], "status": "DISCONNECTED"}
+    ).to_list(50)
+    for conn in prev_connections:
+        try:
+            synced = await sync_device_data(su["id"], conn.get("provider", "terra"), conn.get("device_id", conn.get("provider", "terra")), days=30)
+            await db.device_connections.update_one(
+                {"_id": conn["_id"]},
+                {"$set": {"status": "CONNECTED", "last_sync": now_utc(), "records_synced": synced, "auto_reconnect": True}}
+            )
+        except Exception as e:
+            logger.warning(f"Auto-reconnect failed for device {conn.get('device_id')}: {e}")
     return {"user": su, "token": token}
 
 @api.get("/auth/me")
@@ -311,6 +368,7 @@ def deterministic_activity(user_id: str, days: int, provider: str) -> List[dict]
             "hrv": rng.randint(28, 72),
             "activeMinutes": max(10, 35 + rng.randint(-15, 55)),
             "provider": provider,
+            "synced_at": now_utc(),
         })
     return entries
 
@@ -350,6 +408,24 @@ async def connect_device(payload: DeviceConnectIn, user: dict = Depends(get_curr
         "connected_at": now_utc(),
     }
     await db.devices.update_one({"user_id": user["id"], "id": payload.provider}, {"$set": device}, upsert=True)
+    # Persistent connection record
+    connection_doc = {
+        "user_id": user["id"],
+        "device_id": payload.provider,
+        "provider": meta["provider"],
+        "type": meta["type"],
+        "status": "CONNECTED",
+        "connected_at": now_utc(),
+        "last_sync": now_utc(),
+        "refresh_token": None,
+        "connection_metadata": {"name": meta["name"], "device_key": payload.provider},
+        "auto_reconnect": True,
+    }
+    await db.device_connections.update_one(
+        {"user_id": user["id"], "device_id": payload.provider},
+        {"$set": connection_doc},
+        upsert=True,
+    )
     # Pull 30d of data
     synced = await sync_device_data(user["id"], meta["provider"], payload.provider, days=30)
     await db.devices.update_one({"user_id": user["id"], "id": payload.provider},
@@ -363,21 +439,60 @@ async def resync_device(device_id: str, user: dict = Depends(get_current_user)):
     if not dev: raise HTTPException(status_code=404, detail="Device not connected")
     synced = await sync_device_data(user["id"], dev.get("provider", "terra"), device_id, days=30)
     await db.devices.update_one({"_id": dev["_id"]}, {"$set": {"lastSync": now_iso(), "records_synced": synced}})
+    await db.device_connections.update_one(
+        {"user_id": user["id"], "device_id": device_id},
+        {"$set": {"last_sync": now_utc(), "records_synced": synced}}
+    )
     return {"ok": True, "records_synced": synced, "lastSync": now_iso()}
 
 @api.post("/devices/{device_id}/disconnect")
 async def disconnect_device(device_id: str, user: dict = Depends(get_current_user)):
-    res = await db.devices.delete_one({"user_id": user["id"], "id": device_id})
-    return {"ok": True, "removed": res.deleted_count}
+    # Soft delete: keep record but mark disconnected
+    await db.devices.update_one(
+        {"user_id": user["id"], "id": device_id},
+        {"$set": {"status": "DISCONNECTED", "disconnected_at": now_utc()}}
+    )
+    await db.device_connections.update_one(
+        {"user_id": user["id"], "device_id": device_id},
+        {"$set": {"status": "DISCONNECTED", "disconnected_at": now_utc()}}
+    )
+    return {"ok": True, "status": "DISCONNECTED"}
 
 @api.delete("/devices/{device_id}")
 async def delete_device(device_id: str, user: dict = Depends(get_current_user)):
     await db.devices.delete_one({"user_id": user["id"], "id": device_id})
+    await db.device_connections.delete_one({"user_id": user["id"], "device_id": device_id})
     return {"ok": True}
+
+@api.post("/devices/reconnect-all")
+async def reconnect_all_devices(user: dict = Depends(get_current_user)):
+    """Reconnect all previously disconnected devices for the current user."""
+    disconnected = await db.device_connections.find(
+        {"user_id": user["id"], "status": "DISCONNECTED"}
+    ).to_list(50)
+    reconnected = []
+    for conn in disconnected:
+        device_id = conn.get("device_id")
+        provider = conn.get("provider", "terra")
+        try:
+            synced = await sync_device_data(user["id"], provider, device_id, days=30)
+            await db.devices.update_one(
+                {"user_id": user["id"], "id": device_id},
+                {"$set": {"status": "CONNECTED", "lastSync": now_iso(), "records_synced": synced}}
+            )
+            await db.device_connections.update_one(
+                {"_id": conn["_id"]},
+                {"$set": {"status": "CONNECTED", "last_sync": now_utc(), "records_synced": synced}}
+            )
+            reconnected.append({"device_id": device_id, "status": "CONNECTED", "records_synced": synced})
+        except Exception as e:
+            logger.warning(f"Reconnect failed for {device_id}: {e}")
+            reconnected.append({"device_id": device_id, "status": "FAILED", "error": str(e)})
+    return {"reconnected": reconnected, "count": len(reconnected)}
 
 # ---------------- Nutrition ----------------
 @api.post("/nutrition/analyze")
-async def analyze_food(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+async def analyze_food(file: UploadFile = File(...), user: dict = Depends(require_subscription)):
     contents = await file.read()
     b64 = base64.b64encode(contents).decode("utf-8")
     system = ("You are a certified nutritionist AI. Analyze food images and return ONLY strict JSON matching: "
@@ -399,7 +514,7 @@ async def analyze_food(file: UploadFile = File(...), user: dict = Depends(get_cu
     await update_streak(user["id"]); return entry
 
 @api.get("/nutrition")
-async def list_nutrition(user: dict = Depends(get_current_user), search: Optional[str] = None):
+async def list_nutrition(user: dict = Depends(require_subscription), search: Optional[str] = None):
     q = {"user_id": user["id"]}
     if search: q["foodName"] = {"$regex": re.escape(search), "$options": "i"}
     docs = await db.nutrition.find(q).sort("timestamp", -1).to_list(500)
@@ -416,7 +531,7 @@ async def delete_nutrition(item_id: str, user: dict = Depends(get_current_user))
 
 # ---------------- Journal ----------------
 @api.post("/journal/analyze-text")
-async def analyze_journal_text(payload: Dict[str, str], user: dict = Depends(get_current_user)):
+async def analyze_journal_text(payload: Dict[str, str], user: dict = Depends(require_subscription)):
     text = payload.get("text", "").strip()
     if not text: raise HTTPException(status_code=400, detail="text is required")
     system = ("You are an emotional-wellbeing analyst. Return ONLY strict JSON: "
@@ -429,7 +544,7 @@ async def analyze_journal_text(payload: Dict[str, str], user: dict = Depends(get
     await update_streak(user["id"]); return entry
 
 @api.post("/journal/analyze-audio")
-async def analyze_journal_audio(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+async def analyze_journal_audio(file: UploadFile = File(...), user: dict = Depends(require_subscription)):
     contents = await file.read()
     b64 = base64.b64encode(contents).decode("utf-8")
     mime = file.content_type or "audio/webm"
@@ -463,7 +578,7 @@ async def list_journal(user: dict = Depends(get_current_user), search: Optional[
     return docs
 
 @api.post("/journal/quick")
-async def quick_journal(payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+async def quick_journal(payload: Dict[str, Any], user: dict = Depends(require_subscription)):
     entry = _build_journal_entry(user["id"], payload)
     ins = await db.journal.insert_one(dict(entry)); entry["id"] = str(ins.inserted_id)
     return entry
@@ -473,36 +588,67 @@ async def quick_journal(payload: Dict[str, Any], user: dict = Depends(get_curren
 async def get_activity(user: dict = Depends(get_current_user)):
     doc = await db.activity.find_one({"user_id": user["id"]}, sort=[("date", -1)])
     if not doc:
-        return {"date": date.today().isoformat(), "steps": 0, "sleepHours": 0.0, "sleepQuality": 0,
-                "heartRateAvg": 0, "caloriesBurned": 0}
+        return {
+            "date": date.today().isoformat(), "steps": 0, "sleepHours": 0.0, "sleepQuality": 0,
+            "heartRateAvg": 0, "caloriesBurned": 0, "distanceKm": 0.0, "restingHR": 0, "hrv": 0,
+            "activeMinutes": 0, "provider": "manual", "synced_at": now_iso(),
+        }
     doc["id"] = str(doc.pop("_id")); doc.pop("created_at", None); doc.pop("synced_at", None)
+    # Ensure all enhanced fields are present
+    for field in ("distanceKm", "restingHR", "hrv", "activeMinutes", "provider"):
+        if field not in doc:
+            doc[field] = 0 if field != "provider" else "manual"
+    if "distanceKm" not in doc:
+        doc["distanceKm"] = 0.0
     return doc
 
 @api.post("/activity")
 async def upsert_activity(payload: ActivityIn, user: dict = Depends(get_current_user)):
     dk = payload.date or date.today().isoformat()
-    doc = {"user_id": user["id"], "date": dk, "steps": payload.steps, "sleepHours": payload.sleepHours,
-           "sleepQuality": payload.sleepQuality, "heartRateAvg": payload.heartRateAvg,
-           "caloriesBurned": payload.caloriesBurned, "provider": "manual", "updated_at": now_utc()}
+    doc = {
+        "user_id": user["id"], "date": dk, "steps": payload.steps, "sleepHours": payload.sleepHours,
+        "sleepQuality": payload.sleepQuality, "heartRateAvg": payload.heartRateAvg,
+        "caloriesBurned": payload.caloriesBurned, "provider": "manual", "updated_at": now_utc(),
+        "distanceKm": payload.distanceKm or 0.0,
+        "restingHR": payload.restingHR or 0,
+        "hrv": payload.hrv or 0,
+        "activeMinutes": payload.activeMinutes or 0,
+    }
     await db.activity.update_one({"user_id": user["id"], "date": dk}, {"$set": doc}, upsert=True)
     return {"ok": True, **doc, "updated_at": None}
 
 @api.get("/activity/history")
-async def activity_history(days: int = 7, user: dict = Depends(get_current_user)):
+async def activity_history(
+    days: int = 7,
+    fields: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
     cutoff = (date.today() - timedelta(days=days)).isoformat()
     docs = await db.activity.find({"user_id": user["id"], "date": {"$gte": cutoff}}).sort("date", 1).to_list(120)
-    for d in docs: d["id"] = str(d.pop("_id")); d.pop("created_at", None); d.pop("synced_at", None); d.pop("updated_at", None)
+    for d in docs:
+        d["id"] = str(d.pop("_id")); d.pop("created_at", None); d.pop("synced_at", None); d.pop("updated_at", None)
+        # Ensure all enhanced fields are present
+        for field in ("distanceKm", "restingHR", "hrv", "activeMinutes", "provider"):
+            if field not in d:
+                d[field] = 0 if field != "provider" else "manual"
+    if fields:
+        requested = {f.strip() for f in fields.split(",")}
+        allowed = requested | {"date", "user_id"}
+        for d in docs:
+            for k in list(d.keys()):
+                if k not in allowed:
+                    d.pop(k, None)
     return docs
 
 # ---------------- Chat ----------------
 @api.get("/chat")
-async def list_chat(user: dict = Depends(get_current_user)):
+async def list_chat(user: dict = Depends(require_subscription)):
     docs = await db.chat.find({"user_id": user["id"]}).sort("timestamp", 1).to_list(2000)
     for d in docs: d["id"] = str(d.pop("_id")); d.pop("created_at", None); d.pop("user_id", None)
     return docs
 
 @api.post("/chat")
-async def chat_send(payload: ChatIn, user: dict = Depends(get_current_user)):
+async def chat_send(payload: ChatIn, user: dict = Depends(require_subscription)):
     session_id = payload.session_id or f"chat-{user['id']}"
     user_msg = {"user_id": user["id"], "role": "user", "text": payload.message,
                 "timestamp": now_iso(), "created_at": now_utc()}
@@ -536,7 +682,7 @@ async def chat_send(payload: ChatIn, user: dict = Depends(get_current_user)):
 
 # ---------------- Insights ----------------
 @api.get("/insights")
-async def insights(user: dict = Depends(get_current_user)):
+async def insights(user: dict = Depends(require_subscription)):
     nutrition = await db.nutrition.find({"user_id": user["id"]}).sort("timestamp", -1).limit(10).to_list(10)
     journal = await db.journal.find({"user_id": user["id"]}).sort("timestamp", -1).limit(10).to_list(10)
     activity = await db.activity.find_one({"user_id": user["id"]}, sort=[("date", -1)])
@@ -603,29 +749,37 @@ async def _bundle(user_id: str) -> dict:
     nutrition = await db.nutrition.find({"user_id": user_id}).sort("timestamp", 1).to_list(2000)
     journal = await db.journal.find({"user_id": user_id}).sort("timestamp", 1).to_list(2000)
     devices = await db.devices.find({"user_id": user_id}).to_list(50)
+    device_connections = await db.device_connections.find({"user_id": user_id}).to_list(50)
     chat = await db.chat.find({"user_id": user_id}).sort("timestamp", 1).to_list(2000)
-    for coll in (activity, nutrition, journal, devices, chat):
+    for coll in (activity, nutrition, journal, devices, device_connections, chat):
         for d in coll:
             d["id"] = str(d.pop("_id", ""))
             for k, v in list(d.items()):
                 if isinstance(v, datetime): d[k] = v.isoformat()
             d.pop("user_id", None)
+    # Ensure all wearable fields are present in activity entries
+    for a in activity:
+        for field in ("steps", "sleepHours", "sleepQuality", "heartRateAvg", "restingHR", "hrv", "activeMinutes", "distanceKm", "caloriesBurned", "provider", "synced_at"):
+            if field not in a:
+                a[field] = 0 if field not in ("provider", "synced_at", "date") else ("manual" if field == "provider" else "")
     return {
         "user": {"email": u["email"], "name": u["name"], "created_at": u["created_at"].isoformat() if isinstance(u.get("created_at"), datetime) else u.get("created_at")},
         "export_generated_at": now_iso(),
-        "activity": activity, "nutrition": nutrition, "journal": journal, "devices": devices, "chat": chat,
-        "counts": {"activity": len(activity), "nutrition": len(nutrition), "journal": len(journal), "devices": len(devices), "chat": len(chat)},
+        "activity": activity, "nutrition": nutrition, "journal": journal,
+        "devices": devices, "device_connections": device_connections, "chat": chat,
+        "counts": {"activity": len(activity), "nutrition": len(nutrition), "journal": len(journal),
+                   "devices": len(devices), "device_connections": len(device_connections), "chat": len(chat)},
     }
 
 @api.get("/export/all.json")
-async def export_json(user: dict = Depends(get_current_user)):
+async def export_json(user: dict = Depends(require_subscription)):
     bundle = await _bundle(user["id"])
     payload = json.dumps(bundle, indent=2, default=str).encode()
     return StarletteResponse(payload, media_type="application/json",
                              headers={"Content-Disposition": f'attachment; filename="healthguard-export-{date.today().isoformat()}.json"'})
 
 @api.get("/export/all.csv")
-async def export_csv(user: dict = Depends(get_current_user), collection: str = Query("activity", pattern="^(activity|nutrition|journal)$")):
+async def export_csv(user: dict = Depends(require_subscription), collection: str = Query("activity", pattern="^(activity|nutrition|journal|devices|device_connections|chat)$")):
     bundle = await _bundle(user["id"])
     rows = bundle.get(collection, [])
     buf = io.StringIO()
@@ -640,57 +794,197 @@ async def export_csv(user: dict = Depends(get_current_user), collection: str = Q
                              headers={"Content-Disposition": f'attachment; filename="healthguard-{collection}-{date.today().isoformat()}.csv"'})
 
 @api.get("/export/all.pdf")
-async def export_pdf(user: dict = Depends(get_current_user)):
+async def export_pdf(user: dict = Depends(require_subscription)):
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
-    from reportlab.lib.colors import HexColor
+    from reportlab.lib.colors import HexColor, white, black
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
     bundle = await _bundle(user["id"])
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6*inch)
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6*inch, bottomMargin=0.6*inch, leftMargin=0.7*inch, rightMargin=0.7*inch)
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="H", fontSize=22, textColor=HexColor("#0E5F5C"), leading=26, spaceAfter=6))
-    styles.add(ParagraphStyle(name="Sub", fontSize=11, textColor=HexColor("#3B4A48"), spaceAfter=14))
-    styles.add(ParagraphStyle(name="Sec", fontSize=14, textColor=HexColor("#146356"), spaceBefore=16, spaceAfter=6))
+
+    # Nordic Clinical color palette
+    DEEP_TEAL = HexColor("#0B4F5C")
+    WARM_OFF_WHITE = HexColor("#F4F2ED")
+    SLATE = HexColor("#161B2E")
+    LIGHT_TEAL = HexColor("#1A7A8D")
+    MUTED_SAGE = HexColor("#6B8F71")
+
+    styles.add(ParagraphStyle(name="H", fontSize=24, textColor=DEEP_TEAL, leading=28, spaceAfter=8, fontName="Helvetica-Bold"))
+    styles.add(ParagraphStyle(name="Sub", fontSize=10, textColor=SLATE, spaceAfter=18, fontName="Helvetica"))
+    styles.add(ParagraphStyle(name="Sec", fontSize=13, textColor=DEEP_TEAL, spaceBefore=14, spaceAfter=6, fontName="Helvetica-Bold"))
+    styles.add(ParagraphStyle(name="Body", fontSize=9, textColor=SLATE, leading=12, fontName="Helvetica"))
+    styles.add(ParagraphStyle(name="Bullet", fontSize=9, textColor=SLATE, leading=12, leftIndent=12, spaceAfter=3, fontName="Helvetica"))
+
     elements = [
-        Paragraph("HealthGuardAI — Full Data Export", styles["H"]),
-        Paragraph(f"Owner: <b>{bundle['user']['name']}</b> · {bundle['user']['email']}<br/>Generated {now_iso()}", styles["Sub"]),
+        Paragraph("HealthGuardAI — Clinical Data Export", styles["H"]),
+        Paragraph(f"Owner: <b>{bundle['user']['name']}</b> &nbsp;|&nbsp; {bundle['user']['email']}<br/>Generated: <b>{now_iso()}</b>", styles["Sub"]),
     ]
-    # Summary
+
+    # Summary table
     counts = bundle["counts"]
-    t = Table([["Records", "Count"], ["Activity days", counts["activity"]], ["Nutrition", counts["nutrition"]],
-               ["Journal", counts["journal"]], ["Devices", counts["devices"]], ["Chat messages", counts["chat"]]],
-              colWidths=[3*inch, 3*inch])
-    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0), HexColor("#0E5F5C")),
-                           ("TEXTCOLOR",(0,0),(-1,0), HexColor("#FFFFFF")),
-                           ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
-                           ("GRID",(0,0),(-1,-1), 0.4, HexColor("#DDDDDD")),
-                           ("ROWBACKGROUNDS",(0,1),(-1,-1), [HexColor("#F5F1EA"), HexColor("#FFFFFF")]),
-                           ("PADDING",(0,0),(-1,-1), 8)]))
+    summary_data = [
+        ["Data Category", "Record Count"],
+        ["Activity Days", counts["activity"]],
+        ["Nutrition Entries", counts["nutrition"]],
+        ["Journal Entries", counts["journal"]],
+        ["Connected Devices", counts["devices"]],
+        ["Device Connections", counts["device_connections"]],
+        ["Chat Messages", counts["chat"]],
+    ]
+    t = Table(summary_data, colWidths=[3*inch, 3*inch])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), DEEP_TEAL),
+        ("TEXTCOLOR", (0, 0), (-1, 0), white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 10),
+        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 10),
+        ("BACKGROUND", (0, 1), (-1, -1), WARM_OFF_WHITE),
+        ("TEXTCOLOR", (0, 1), (-1, -1), SLATE),
+        ("GRID", (0, 0), (-1, -1), 0.5, HexColor("#D4CFC7")),
+        ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+        ("PADDING", (0, 0), (-1, -1), 8),
+        ("FONTSIZE", (0, 1), (-1, -1), 9),
+    ]))
     elements.append(t)
-    # Activity
-    elements.append(Paragraph("Activity (last 14 days)", styles["Sec"]))
-    a_rows = [["Date","Steps","Sleep","HR avg","Calories","Provider"]]
-    for a in bundle["activity"][-14:]:
-        a_rows.append([a.get("date",""), a.get("steps",""), f"{a.get('sleepHours','')}h", a.get("heartRateAvg",""), a.get("caloriesBurned",""), a.get("provider","manual")])
+    elements.append(Spacer(1, 0.15*inch))
+
+    # Activity table with ALL fields
+    elements.append(Paragraph("Activity Data (All Fields)", styles["Sec"]))
+    activity_headers = ["Date", "Steps", "Sleep", "Quality", "HR Avg", "Rest HR", "HRV", "Active Min", "Distance", "Calories", "Provider"]
+    a_rows = [activity_headers]
+    for a in bundle["activity"]:
+        a_rows.append([
+            a.get("date", ""),
+            str(a.get("steps", "")),
+            f"{a.get('sleepHours', '')}h",
+            str(a.get("sleepQuality", "")),
+            str(a.get("heartRateAvg", "")),
+            str(a.get("restingHR", "")),
+            str(a.get("hrv", "")),
+            str(a.get("activeMinutes", "")),
+            f"{a.get('distanceKm', '')}km",
+            str(a.get("caloriesBurned", "")),
+            a.get("provider", "manual"),
+        ])
     if len(a_rows) > 1:
-        at = Table(a_rows, colWidths=[1.1*inch,0.8*inch,0.8*inch,0.9*inch,1*inch,1.2*inch])
-        at.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0), HexColor("#146356")),
-                                ("TEXTCOLOR",(0,0),(-1,0), HexColor("#FFFFFF")),
-                                ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
-                                ("GRID",(0,0),(-1,-1), 0.3, HexColor("#E4DED4")),
-                                ("PADDING",(0,0),(-1,-1), 6),
-                                ("FONTSIZE",(0,0),(-1,-1), 9)]))
+        col_widths = [0.95*inch, 0.6*inch, 0.6*inch, 0.55*inch, 0.6*inch, 0.6*inch, 0.5*inch, 0.65*inch, 0.65*inch, 0.7*inch, 0.75*inch]
+        at = Table(a_rows, colWidths=col_widths, repeatRows=1)
+        at.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), DEEP_TEAL),
+            ("TEXTCOLOR", (0, 0), (-1, 0), white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 8),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+            ("BACKGROUND", (0, 1), (-1, -1), WARM_OFF_WHITE),
+            ("TEXTCOLOR", (0, 1), (-1, -1), SLATE),
+            ("GRID", (0, 0), (-1, -1), 0.4, HexColor("#D4CFC7")),
+            ("PADDING", (0, 0), (-1, -1), 5),
+            ("FONTSIZE", (0, 1), (-1, -1), 7.5),
+            ("ALIGN", (0, 1), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WARM_OFF_WHITE, white]),
+        ]))
         elements.append(at)
+    else:
+        elements.append(Paragraph("No activity data available.", styles["Body"]))
+
+    elements.append(Spacer(1, 0.1*inch))
+
     # Nutrition
-    elements.append(Paragraph("Recent Nutrition", styles["Sec"]))
-    for n in bundle["nutrition"][-10:]:
-        elements.append(Paragraph(f"• <b>{n.get('foodName','')}</b> — {int(float(n.get('calories',0) or 0))} kcal · health {int(float(n.get('healthScore',0) or 0))}/100", styles["Normal"]))
+    elements.append(Paragraph("Nutrition Log", styles["Sec"]))
+    if bundle["nutrition"]:
+        n_rows = [["Food", "Calories", "Protein", "Carbs", "Fat", "Health Score"]]
+        for n in bundle["nutrition"][-20:]:
+            n_rows.append([
+                n.get("foodName", ""),
+                str(int(float(n.get("calories", 0) or 0))),
+                f"{float(n.get('protein', 0) or 0):.1f}g",
+                f"{float(n.get('carbs', 0) or 0):.1f}g",
+                f"{float(n.get('fat', 0) or 0):.1f}g",
+                f"{int(float(n.get('healthScore', 0) or 0))}/100",
+            ])
+        nt = Table(n_rows, colWidths=[2.2*inch, 0.9*inch, 0.9*inch, 0.9*inch, 0.9*inch, 1.1*inch])
+        nt.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), LIGHT_TEAL),
+            ("TEXTCOLOR", (0, 0), (-1, 0), white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+            ("GRID", (0, 0), (-1, -1), 0.4, HexColor("#D4CFC7")),
+            ("PADDING", (0, 0), (-1, -1), 6),
+            ("FONTSIZE", (0, 1), (-1, -1), 8),
+            ("ALIGN", (0, 1), (-1, -1), "CENTER"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WARM_OFF_WHITE, white]),
+        ]))
+        elements.append(nt)
+    else:
+        elements.append(Paragraph("No nutrition data available.", styles["Body"]))
+
+    elements.append(Spacer(1, 0.1*inch))
+
     # Journal
-    elements.append(Paragraph("Recent Journal", styles["Sec"]))
-    for j in bundle["journal"][-8:]:
-        elements.append(Paragraph(f"• <b>{j.get('mood','')}</b> (stress {j.get('stressLevel','')}/10) — {j.get('summary','')}", styles["Normal"]))
+    elements.append(Paragraph("Journal Entries", styles["Sec"]))
+    if bundle["journal"]:
+        for j in bundle["journal"][-10:]:
+            elements.append(Paragraph(
+                f"• <b>{j.get('mood','')}</b> (stress {j.get('stressLevel','')}/10, sentiment {j.get('sentimentScore',0):.2f}) — {j.get('summary','')}",
+                styles["Bullet"]
+            ))
+    else:
+        elements.append(Paragraph("No journal entries available.", styles["Body"]))
+
+    elements.append(Spacer(1, 0.1*inch))
+
+    # Devices
+    elements.append(Paragraph("Connected Devices", styles["Sec"]))
+    if bundle["devices"]:
+        d_rows = [["Device ID", "Name", "Type", "Provider", "Status", "Last Sync"]]
+        for d in bundle["devices"]:
+            d_rows.append([
+                d.get("id", ""),
+                d.get("name", ""),
+                d.get("type", ""),
+                d.get("provider", ""),
+                d.get("status", ""),
+                d.get("lastSync", ""),
+            ])
+        dt = Table(d_rows, colWidths=[1.2*inch, 1.3*inch, 0.9*inch, 1*inch, 0.9*inch, 1.2*inch])
+        dt.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), MUTED_SAGE),
+            ("TEXTCOLOR", (0, 0), (-1, 0), white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+            ("GRID", (0, 0), (-1, -1), 0.4, HexColor("#D4CFC7")),
+            ("PADDING", (0, 0), (-1, -1), 6),
+            ("FONTSIZE", (0, 1), (-1, -1), 8),
+            ("ALIGN", (0, 1), (-1, -1), "CENTER"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WARM_OFF_WHITE, white]),
+        ]))
+        elements.append(dt)
+    else:
+        elements.append(Paragraph("No devices connected.", styles["Body"]))
+
+    elements.append(Spacer(1, 0.1*inch))
+
+    # Chat
+    elements.append(Paragraph("Recent Chat Messages", styles["Sec"]))
+    if bundle["chat"]:
+        chat_count = 0
+        for c in bundle["chat"][-10:]:
+            role_label = "User" if c.get("role") == "user" else "AI"
+            elements.append(Paragraph(f"<b>{role_label}:</b> {c.get('text', '')[:200]}", styles["Bullet"]))
+            chat_count += 1
+    else:
+        elements.append(Paragraph("No chat messages available.", styles["Body"]))
+
     doc.build(elements); buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf",
                              headers={"Content-Disposition": f'attachment; filename="healthguard-full-export-{date.today().isoformat()}.pdf"'})
@@ -713,9 +1007,32 @@ async def admin_stats(admin: dict = Depends(require_admin)):
     new_users = await db.users.count_documents({"created_at": {"$gte": week_ago}})
     high_stress = await db.journal.find({"stressLevel": {"$gte": 8}}).sort("timestamp", -1).limit(10).to_list(10)
     for h in high_stress: h["id"] = str(h.pop("_id")); h.pop("created_at", None)
-    return {"users_total": users_total, "meals_total": meals_total, "journals_total": journals_total,
-            "chats_total": chats_total, "devices_total": devices_total,
-            "paying_users": paying, "new_users_7d": new_users, "high_stress_events": high_stress}
+
+    # Monthly revenue
+    month_start = now_utc().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    monthly_paid = await db.payment_transactions.find({
+        "payment_status": "paid",
+        "completed_at": {"$gte": month_start}
+    }).to_list(1000)
+    monthly_revenue_usd = sum(float(tx.get("amount", 0)) for tx in monthly_paid)
+
+    # Trial conversion rate
+    users_with_trial = await db.users.count_documents({"trial_started_at": {"$exists": True}})
+    trial_completed = await db.users.count_documents({"trial_started_at": {"$exists": True}, "paid_until": {"$exists": True, "$ne": None}})
+    trial_conversion_rate = round((trial_completed / users_with_trial) * 100, 2) if users_with_trial > 0 else 0.0
+
+    # Device connection rate
+    users_with_device = await db.device_connections.distinct("user_id")
+    device_connection_rate = round((len(users_with_device) / users_total) * 100, 2) if users_total > 0 else 0.0
+
+    return {
+        "users_total": users_total, "meals_total": meals_total, "journals_total": journals_total,
+        "chats_total": chats_total, "devices_total": devices_total,
+        "paying_users": paying, "new_users_7d": new_users, "high_stress_events": high_stress,
+        "monthly_revenue_usd": monthly_revenue_usd,
+        "trial_conversion_rate": trial_conversion_rate,
+        "device_connection_rate": device_connection_rate,
+    }
 
 @api.get("/admin/users")
 async def admin_users(admin: dict = Depends(require_admin)):
@@ -742,6 +1059,7 @@ async def on_startup():
     await db.chat.create_index([("user_id", 1), ("timestamp", 1)])
     await db.activity.create_index([("user_id", 1), ("date", -1)], unique=False)
     await db.devices.create_index([("user_id", 1), ("id", 1)], unique=True)
+    await db.device_connections.create_index([("user_id", 1), ("device_id", 1)], unique=True)
     await db.payment_transactions.create_index([("user_id", 1), ("session_id", 1)])
 
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@healthguard.ai").lower()
