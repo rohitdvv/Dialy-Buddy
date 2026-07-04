@@ -4,40 +4,64 @@ import { formatApiError } from '../lib/api.js'
 import { Shield, Loader2, Check, ArrowRight, Sparkle } from 'lucide-react'
 
 export default function AuthScreen() {
-  const { login, register } = useAuth()
+  const { login, requestOtp, resendOtp, verifyOtp } = useAuth()
   const [mode, setMode] = useState('login')
   const [step, setStep] = useState('CRED') // CRED | OTP
-  const [form, setForm] = useState({ name: '', email: '', password: '' })
+  const [form, setForm] = useState({ firstName: '', lastName: '', dob: '', email: '', password: '' })
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [devCode, setDevCode] = useState('')
   const [loading, setLoading] = useState(false)
+  const [resending, setResending] = useState(false)
   const [otp, setOtp] = useState('')
-  const [generatedOtp, setGeneratedOtp] = useState('')
 
-  const switchMode = (m) => { setMode(m); setError(''); setNotice(''); setStep('CRED') }
+  const switchMode = (m) => { setMode(m); setError(''); setNotice(''); setDevCode(''); setStep('CRED') }
+
+  const applyOtpResponse = (data) => {
+    if (data?.dev_mode && data?.dev_code) {
+      setDevCode(data.dev_code)
+      setNotice(`Email delivery isn't configured yet, so here's your code for testing: ${data.dev_code}`)
+    } else {
+      setDevCode('')
+      setNotice(`We sent a 6-digit code to ${data?.email || form.email}. It expires in ${data?.expires_in_minutes || 10} minutes.`)
+    }
+  }
 
   const submit = async (e) => {
-    e.preventDefault(); setError(''); setNotice('')
+    e.preventDefault(); setError(''); setNotice(''); setDevCode('')
     if (mode === 'login') {
       setLoading(true)
       try { await login(form.email.trim().toLowerCase(), form.password) }
       catch (err) { setError(formatApiError(err)) }
       finally { setLoading(false) }
     } else {
-      if (!form.name.trim()) return setError('Name is required.')
-      const code = String(Math.floor(100000 + Math.random() * 900000))
-      setGeneratedOtp(code); setStep('OTP')
-      setNotice(`Verification code sent to ${form.email}: ${code}`)
+      if (!form.firstName.trim() || !form.lastName.trim()) return setError('Please enter your first and last name.')
+      if (!form.dob) return setError('Please enter your date of birth.')
+      setLoading(true)
+      try {
+        const data = await requestOtp({
+          firstName: form.firstName.trim(), lastName: form.lastName.trim(),
+          dateOfBirth: form.dob, email: form.email.trim().toLowerCase(), password: form.password,
+        })
+        setOtp(''); setStep('OTP'); applyOtpResponse(data)
+      } catch (err) { setError(formatApiError(err)) }
+      finally { setLoading(false) }
     }
   }
 
   const verify = async (e) => {
     e.preventDefault()
-    if (otp !== generatedOtp) return setError('Invalid code. Please try again.')
     setLoading(true); setError('')
-    try { await register(form.name, form.email.trim().toLowerCase(), form.password) }
-    catch (err) { setError(formatApiError(err)); setStep('CRED') }
+    try { await verifyOtp(form.email.trim().toLowerCase(), otp) }
+    catch (err) { setError(formatApiError(err)) }
     finally { setLoading(false) }
+  }
+
+  const resend = async () => {
+    setResending(true); setError('')
+    try { const data = await resendOtp(form.email.trim().toLowerCase()); applyOtpResponse(data); setOtp('') }
+    catch (err) { setError(formatApiError(err)) }
+    finally { setResending(false) }
   }
 
   return (
@@ -90,7 +114,13 @@ export default function AuthScreen() {
 
               <form onSubmit={submit} className="space-y-4" data-testid="auth-form">
                 {mode === 'signup' && (
-                  <Field label="Full name" data-testid="auth-name-input" value={form.name} onChange={v => setForm({ ...form, name: v })} placeholder="Elena Rossi" />
+                  <>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field label="First name" data-testid="auth-firstname-input" value={form.firstName} onChange={v => setForm({ ...form, firstName: v })} placeholder="Elena" />
+                      <Field label="Last name" data-testid="auth-lastname-input" value={form.lastName} onChange={v => setForm({ ...form, lastName: v })} placeholder="Rossi" />
+                    </div>
+                    <Field label="Date of birth" type="date" data-testid="auth-dob-input" value={form.dob} onChange={v => setForm({ ...form, dob: v })} />
+                  </>
                 )}
                 <Field label="Email" type="email" data-testid="auth-email-input" value={form.email} onChange={v => setForm({ ...form, email: v })} placeholder="you@work.com" />
                 <Field label="Password" type="password" data-testid="auth-password-input" value={form.password} onChange={v => setForm({ ...form, password: v })} placeholder="Minimum 6 characters" />
@@ -120,11 +150,17 @@ export default function AuthScreen() {
             </>
           ) : (
             <div className="space-y-6">
-              <button onClick={() => { setStep('CRED'); setError(''); setNotice('') }} className="text-sm text-ink2 hover:text-ink" data-testid="auth-otp-back">← Back</button>
+              <button onClick={() => { setStep('CRED'); setError(''); setNotice(''); setDevCode('') }} className="text-sm text-ink2 hover:text-ink" data-testid="auth-otp-back">← Back</button>
               <div>
-                <h2 className="font-display font-display-title text-4xl">Verify email</h2>
-                <p className="text-ink2 mt-2 text-sm">Enter the 6-digit code sent to <span className="text-ink">{form.email}</span></p>
-                {notice && <p className="mt-1 text-xs text-copper">{notice}</p>}
+                <h2 className="font-display font-display-title text-4xl">Check your email</h2>
+                <p className="text-ink2 mt-2 text-sm">We sent a 6-digit code to <span className="text-ink">{form.email}</span></p>
+                {notice && <p className="mt-2 text-xs text-copper" data-testid="auth-notice">{notice}</p>}
+                {devCode && (
+                  <div className="mt-3 px-3 py-2.5 rounded-xl border border-amber/40 bg-amber/10 text-ink2 text-xs" data-testid="auth-dev-code">
+                    <span className="uppercase tracking-[0.2em] text-[10px] text-muted">Test mode</span>
+                    <div className="font-mono text-lg text-ink mt-0.5 tracking-[0.3em]">{devCode}</div>
+                  </div>
+                )}
               </div>
               <form onSubmit={verify} className="space-y-4">
                 <input data-testid="auth-otp-input" value={otp} maxLength={6} onChange={e => setOtp(e.target.value.replace(/[^0-9]/g,''))}
@@ -134,6 +170,12 @@ export default function AuthScreen() {
                   {loading ? 'Creating account…' : 'Verify & Continue'}
                 </button>
               </form>
+              <div className="text-center text-sm text-ink2">
+                Didn't get it?{' '}
+                <button onClick={resend} disabled={resending} data-testid="auth-otp-resend" className="text-teal font-medium hover:underline disabled:opacity-50">
+                  {resending ? 'Sending…' : 'Resend code'}
+                </button>
+              </div>
             </div>
           )}
         </div>

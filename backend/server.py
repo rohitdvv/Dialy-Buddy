@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os, io, re, csv, json, bcrypt, base64, secrets, hashlib, logging, random
+import asyncio, smtplib, ssl
+from email.message import EmailMessage
 import jwt as pyjwt
 from datetime import datetime, timezone, timedelta, date
 from typing import List, Optional, Dict, Any
@@ -41,6 +43,16 @@ TERRA_DEV_ID = os.environ.get("TERRA_DEV_ID", "")
 FITBIT_CLIENT_ID = os.environ.get("FITBIT_CLIENT_ID", "")
 FITBIT_CLIENT_SECRET = os.environ.get("FITBIT_CLIENT_SECRET", "")
 
+# ---- Email (OTP) ----
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER or "no-reply@healthguard.ai")
+SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "HealthGuardAI")
+OTP_TTL_MINUTES = int(os.environ.get("OTP_TTL_MINUTES", "10"))
+EMAIL_ENABLED = bool(SMTP_HOST and SMTP_USER and SMTP_PASS)
+
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
@@ -65,6 +77,62 @@ def create_access_token(user_id: str, email: str, role: str = "user") -> str:
 
 def now_utc() -> datetime: return datetime.now(timezone.utc)
 def now_iso() -> str: return now_utc().isoformat()
+
+# ---- Email / OTP helpers ----
+def gen_otp() -> str:
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+def _otp_email_html(first_name: str, code: str) -> str:
+    name = (first_name or "there").strip()
+    return f"""\
+<div style="font-family:Georgia,'Times New Roman',serif;background:#F5F1EA;padding:32px">
+  <div style="max-width:480px;margin:0 auto;background:#fff;border:1px solid #E4DED4;border-radius:20px;overflow:hidden">
+    <div style="background:linear-gradient(135deg,#0E5F5C,#146356);padding:28px 32px;color:#fff">
+      <div style="font-size:22px;letter-spacing:-0.5px">HealthGuard<span style="opacity:.7">AI</span></div>
+      <div style="font-size:11px;letter-spacing:3px;text-transform:uppercase;opacity:.7;margin-top:4px">Preventive Wellness</div>
+    </div>
+    <div style="padding:32px">
+      <p style="font-size:16px;color:#1B2321;margin:0 0 8px">Hi {name},</p>
+      <p style="font-size:15px;color:#3B4A48;line-height:1.6;margin:0 0 24px">
+        Use the verification code below to finish creating your account. It expires in {OTP_TTL_MINUTES} minutes.
+      </p>
+      <div style="text-align:center;margin:0 0 24px">
+        <div style="display:inline-block;font-family:'Courier New',monospace;font-size:34px;letter-spacing:12px;
+                    color:#0E5F5C;background:#FCFAF5;border:1px solid #E4DED4;border-radius:14px;padding:16px 24px">
+          {code}
+        </div>
+      </div>
+      <p style="font-size:13px;color:#7A8583;line-height:1.6;margin:0">
+        If you didn't request this, you can safely ignore this email.
+      </p>
+    </div>
+    <div style="padding:16px 32px;border-top:1px solid #E4DED4;font-size:11px;color:#7A8583">
+      © HealthGuardAI · SOC-2 aligned
+    </div>
+  </div>
+</div>"""
+
+def _send_email_sync(to_email: str, subject: str, html: str, text: str) -> None:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM}>"
+    msg["To"] = to_email
+    msg.set_content(text)
+    msg.add_alternative(html, subtype="html")
+    context = ssl.create_default_context()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.ehlo()
+        server.starttls(context=context)
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+
+async def send_email(to_email: str, subject: str, html: str, text: str) -> bool:
+    """Send an email via SMTP. Returns True if sent, False if email isn't configured."""
+    if not EMAIL_ENABLED:
+        return False
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _send_email_sync, to_email, subject, html, text)
+    return True
 
 def sanitize_user(u: dict) -> dict:
     u = dict(u); u["id"] = str(u.pop("_id")); u.pop("password_hash", None)
@@ -116,6 +184,20 @@ class RegisterIn(BaseModel):
     name: str
     email: EmailStr
     password: str = Field(min_length=6)
+
+class RegisterRequestIn(BaseModel):
+    first_name: str = Field(min_length=1, max_length=60)
+    last_name: str = Field(min_length=1, max_length=60)
+    date_of_birth: str = Field(min_length=1)  # YYYY-MM-DD
+    email: EmailStr
+    password: str = Field(min_length=6)
+
+class VerifyOtpIn(BaseModel):
+    email: EmailStr
+    code: str
+
+class ResendOtpIn(BaseModel):
+    email: EmailStr
 
 class LoginIn(BaseModel):
     email: EmailStr; password: str
@@ -169,6 +251,98 @@ async def register(payload: RegisterIn):
         "streak": 0, "last_activity_date": None, "badges": [],
     }
     res = await db.users.insert_one(doc); doc["_id"] = res.inserted_id
+    user = sanitize_user(doc); user["billing"] = compute_billing(doc)
+    token = create_access_token(user["id"], user["email"], user["role"])
+    return {"user": user, "token": token}
+
+async def _issue_otp(pending_updates: dict, email: str, first_name: str) -> dict:
+    """Generate + persist an OTP for a pending signup and email it. Shared by request/resend."""
+    code = gen_otp()
+    now = now_utc()
+    await db.pending_registrations.update_one(
+        {"email": email},
+        {"$set": {**pending_updates, "email": email, "code": code,
+                  "expires_at": now + timedelta(minutes=OTP_TTL_MINUTES),
+                  "attempts": 0, "updated_at": now}},
+        upsert=True,
+    )
+    subject = "Your HealthGuardAI verification code"
+    text = (f"Your HealthGuardAI verification code is {code}. "
+            f"It expires in {OTP_TTL_MINUTES} minutes.")
+    sent = False
+    try:
+        sent = await send_email(email, subject, _otp_email_html(first_name, code), text)
+    except Exception:
+        logger.exception("OTP email send failed")
+        sent = False
+    resp = {"sent": sent, "email": email, "expires_in_minutes": OTP_TTL_MINUTES}
+    if not EMAIL_ENABLED:
+        # Dev fallback: no SMTP configured, so surface the code to keep the app usable.
+        logger.info(f"[DEV OTP] {email} -> {code}")
+        resp["dev_mode"] = True
+        resp["dev_code"] = code
+    elif not sent:
+        raise HTTPException(status_code=502, detail="Could not send the verification email. Please try again.")
+    return resp
+
+@api.post("/auth/register/request-otp")
+async def register_request_otp(payload: RegisterRequestIn):
+    email = payload.email.lower().strip()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="Email already registered. Try signing in instead.")
+    first = payload.first_name.strip()
+    last = payload.last_name.strip()
+    return await _issue_otp({
+        "first_name": first, "last_name": last, "name": f"{first} {last}".strip(),
+        "date_of_birth": payload.date_of_birth.strip(),
+        "password_hash": hash_password(payload.password),
+        "created_at": now_utc(),
+    }, email, first)
+
+@api.post("/auth/register/resend-otp")
+async def register_resend_otp(payload: ResendOtpIn):
+    email = payload.email.lower().strip()
+    pending = await db.pending_registrations.find_one({"email": email})
+    if not pending:
+        raise HTTPException(status_code=400, detail="No pending signup found. Please start again.")
+    return await _issue_otp({}, email, pending.get("first_name", ""))
+
+@api.post("/auth/register/verify")
+async def register_verify(payload: VerifyOtpIn):
+    email = payload.email.lower().strip()
+    pending = await db.pending_registrations.find_one({"email": email})
+    if not pending:
+        raise HTTPException(status_code=400, detail="No pending signup found. Please start again.")
+    exp = pending.get("expires_at")
+    if isinstance(exp, str):
+        try: exp = datetime.fromisoformat(exp)
+        except Exception: exp = None
+    if exp is not None and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp is None or now_utc() > exp:
+        await db.pending_registrations.delete_one({"email": email})
+        raise HTTPException(status_code=400, detail="Code expired. Please request a new one.")
+    if pending.get("attempts", 0) >= 6:
+        await db.pending_registrations.delete_one({"email": email})
+        raise HTTPException(status_code=429, detail="Too many attempts. Please start again.")
+    if payload.code.strip() != pending.get("code"):
+        await db.pending_registrations.update_one({"email": email}, {"$inc": {"attempts": 1}})
+        raise HTTPException(status_code=400, detail="Invalid code. Please try again.")
+    if await db.users.find_one({"email": email}):
+        await db.pending_registrations.delete_one({"email": email})
+        raise HTTPException(status_code=400, detail="Email already registered. Try signing in instead.")
+    now = now_utc()
+    doc = {
+        "email": email, "name": pending.get("name", ""),
+        "first_name": pending.get("first_name"), "last_name": pending.get("last_name"),
+        "date_of_birth": pending.get("date_of_birth"),
+        "password_hash": pending["password_hash"],
+        "role": "user", "created_at": now, "email_verified": True,
+        "trial_started_at": now, "paid_until": None,
+        "streak": 0, "last_activity_date": None, "badges": [],
+    }
+    res = await db.users.insert_one(doc); doc["_id"] = res.inserted_id
+    await db.pending_registrations.delete_one({"email": email})
     user = sanitize_user(doc); user["billing"] = compute_billing(doc)
     token = create_access_token(user["id"], user["email"], user["role"])
     return {"user": user, "token": token}

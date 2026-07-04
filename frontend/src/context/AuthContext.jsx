@@ -34,13 +34,28 @@ export function AuthProvider({ children }) {
     const { data } = await api.post('/auth/register', { name, email, password })
     localStorage.setItem('hg_token', data.token); applyMe(data.user); return data.user
   }
+  // Real email-OTP signup flow
+  const requestOtp = async ({ firstName, lastName, dateOfBirth, email, password }) => {
+    const { data } = await api.post('/auth/register/request-otp', {
+      first_name: firstName, last_name: lastName, date_of_birth: dateOfBirth, email, password,
+    })
+    return data // { sent, email, expires_in_minutes, dev_mode?, dev_code? }
+  }
+  const resendOtp = async (email) => {
+    const { data } = await api.post('/auth/register/resend-otp', { email })
+    return data
+  }
+  const verifyOtp = async (email, code) => {
+    const { data } = await api.post('/auth/register/verify', { email, code })
+    localStorage.setItem('hg_token', data.token); applyMe(data.user); return data.user
+  }
   const logout = () => { localStorage.removeItem('hg_token'); setUser(null); setBilling(null) }
   const refreshBilling = async () => {
     try { const { data } = await api.get('/billing/status'); setBilling(data); return data } catch {}
   }
 
   return (
-    <AuthContext.Provider value={{ user, billing, loading, login, register, logout, refresh, refreshBilling }}>
+    <AuthContext.Provider value={{ user, billing, loading, login, register, requestOtp, resendOtp, verifyOtp, logout, refresh, refreshBilling }}>
       {children}
     </AuthContext.Provider>
   )
