@@ -4,31 +4,32 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Nordic Clinical + Deep Forest palette
-        bg: '#F5F1EA',          // warm ivory base
+        // Nordic Clinical palette
+        bg: '#F4F2ED',          // warm ivory base
         surface: '#FFFFFF',      // primary card surface
-        surface2: '#EFEAE0',     // subtle depth
-        border: '#E4DED4',       // hairline
-        ink: '#1B2321',          // primary text (deep slate-green)
-        ink2: '#3B4A48',         // secondary text
-        muted: '#7A8583',        // tertiary text
-        teal: '#0E5F5C',         // primary — deep teal
-        emerald: '#146356',      // secondary — deep forest
-        moss: '#4A7A5F',         // success sage
-        copper: '#B96A3A',       // warm accent
-        amber: '#C69749',        // gold accent (badges)
-        rust: '#A94A3A',         // soft alert
-        sky: '#3A6E8F',          // info accent
+        surface2: '#F9F7F2',     // subtle depth
+        border: '#DDD8CF',       // hairline
+        'border-strong': '#C8C2B8', // stronger border
+        ink: '#161B2E',          // primary text
+        ink2: '#3D4556',         // secondary text
+        muted: '#8B92A5',        // tertiary text
+        teal: '#0B4F5C',         // primary — deep teal
+        emerald: '#0F5C4F',      // secondary — deep forest
+        moss: '#3D6B5A',         // success sage
+        copper: '#B87333',       // warm accent
+        amber: '#C8A040',        // gold accent (badges)
+        rust: '#8B3D3D',         // soft alert
+        sky: '#2D5F8F',          // info accent
       },
       fontFamily: {
-        display: ['Fraunces', 'ui-serif', 'Georgia', 'serif'],
-        sans: ['Geist', 'ui-sans-serif', 'system-ui', 'sans-serif'],
-        mono: ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
+        display: ['Playfair Display', 'ui-serif', 'Georgia', 'serif'],
+        sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        mono: ['JetBrains Mono', 'ui-monospace', 'monospace'],
       },
       boxShadow: {
-        'soft': '0 1px 2px rgba(27,35,33,0.04), 0 8px 32px -12px rgba(27,35,33,0.10)',
-        'card': '0 1px 2px rgba(27,35,33,0.05), 0 12px 40px -18px rgba(14,95,92,0.18)',
-        'ring-teal': '0 0 0 3px rgba(14,95,92,0.15)',
+        'soft': '0 1px 2px rgba(22,27,46,0.04), 0 8px 32px -12px rgba(22,27,46,0.10)',
+        'card': '0 1px 2px rgba(22,27,46,0.05), 0 12px 40px -18px rgba(11,79,92,0.16)',
+        'ring-teal': '0 0 0 3px rgba(11,79,92,0.15)',
       },
     },
   },
